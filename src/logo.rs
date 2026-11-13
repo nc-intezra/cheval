@@ -223,6 +223,29 @@ mod tests {
     }
 
     #[test]
+    fn man_page_names_the_current_version_and_every_command() {
+        let man = include_str!("../man/cheval.1");
+        assert!(man.contains(&format!("\"cheval {VERSION}\"")), "man/cheval.1: update the version in .TH");
+        for cmd in [
+            "sync",
+            "daemon",
+            "verify",
+            "check",
+            "example",
+            "probe",
+            "import",
+            "sources",
+            "snapshot create",
+            "bundle create",
+            "bundle apply",
+            "status listen",
+            "version",
+        ] {
+            assert!(man.contains(&format!(".B {cmd}")) || man.contains(&format!(".BR {cmd}")), "man page lacks {cmd}");
+        }
+    }
+
+    #[test]
     fn off_draws_nothing() {
         assert!(banner(Charset::Off).is_empty());
         assert!(about(Charset::Off).is_empty());

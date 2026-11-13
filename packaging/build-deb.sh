@@ -15,6 +15,11 @@ install -Dm644 "$SRC/examples/cheval.toml" "$STAGE/usr/share/doc/cheval/examples
 if [ -f "$SRC/docs/status-stream.md" ]; then
     install -Dm644 "$SRC/docs/status-stream.md" "$STAGE/usr/share/doc/cheval/status-stream.md"
 fi
+if [ -f "$SRC/man/cheval.1" ]; then
+    install -d "$STAGE/usr/share/man/man1"
+    gzip -9nc "$SRC/man/cheval.1" > "$STAGE/usr/share/man/man1/cheval.1.gz"
+    chmod 644 "$STAGE/usr/share/man/man1/cheval.1.gz"
+fi
 if [ -f "$SRC/CHANGELOG.md" ]; then
     gzip -9nc "$SRC/CHANGELOG.md" > "$STAGE/usr/share/doc/cheval/changelog.gz"
     chmod 644 "$STAGE/usr/share/doc/cheval/changelog.gz"

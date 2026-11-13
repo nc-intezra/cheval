@@ -1383,3 +1383,118 @@ fn status_configuration_is_validated() {
         assert!(err.contains(why), "{bad:?} -> {err}");
     }
 }
+
+// ------------------------------------------------------ per-repository bundles (v0.6.1)
+
+fn named_repo(name: &str, url: &str, dir: &str, suite: &str) -> String {
+    format!(
+        "[[repo]]\nname = \"{name}\"\nurl = \"{url}\"\nsuites = [\"{suite}\"]\ncomponents = [\"main\"]\n\
+         architectures = [\"amd64\"]\nmirror_dir = \"{dir}\"\nverify = \"off\"\n"
+    )
+}
+
+#[tokio::test]
+async fn bundles_of_single_repositories() {
+    let (up, base, far) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ra, rb) = (up.path().join("a"), up.path().join("b"));
+    Fixture::default().build(&ra, "stable", &[pkg("alpha", "1.0"), pkg("apple", "1.0")]);
+    Fixture::default().build(&rb, "stable", &[pkg("beta", "1.0")]);
+    let srv = serve(up.path().to_path_buf()).await;
+    let host = srv.url.trim_end_matches("/repo").to_string();
+    let repos = format!(
+        "{}{}{}",
+        named_repo("a", &format!("{host}/a"), "a", "stable"),
+        named_repo("b", &format!("{host}/b"), "b", "stable"),
+        // A second entry on b's upstream directory: it shares b's pool.
+        named_repo("b-again", &format!("{host}/b"), "b", "stable"),
+    );
+    let cfg: Config =
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{repos}", base.path().to_str().unwrap())).unwrap();
+    sync_ok(base.path(), &repos).await;
+    let (fm, only) = (far.path().join("mirror"), |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+    let tar = |n: &str| base.path().join(n);
+    let files_in = |p: &Path| -> Vec<String> {
+        let mut ar = tar::Archive::new(std::fs::File::open(p).unwrap());
+        ar.entries().unwrap().map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned()).collect()
+    };
+
+    // Only repository a crosses; nothing of b is in the file or on the far side.
+    cheval::bundle::create_only(&cfg, &only(&["a"]), &tar("a1.tar"), false, None).unwrap();
+    let listed = files_in(&tar("a1.tar"));
+    assert!(listed.iter().any(|f| f == "a/dists/stable/Release") && listed.iter().any(|f| f.starts_with("a/pool/")));
+    assert!(!listed.iter().any(|f| f.starts_with("b/")), "{listed:?}");
+    cheval::bundle::apply(&tar("a1.tar"), &fm, false).unwrap();
+    assert!(deb_path(&fm.join("a"), "alpha", "1.0").is_file() && !fm.join("b").exists());
+
+    // Repositories sharing a directory cannot be split; unknown names are errors.
+    let err = cheval::bundle::create_only(&cfg, &only(&["b"]), &tar("x.tar"), false, None).unwrap_err().to_string();
+    assert!(err.contains("b-again") && err.contains("--only b-again"), "{err}");
+    assert!(cheval::bundle::create_only(&cfg, &only(&["nope"]), &tar("x.tar"), false, None).is_err());
+    assert!(!tar("x.tar").exists());
+
+    // Nothing changed in a: no file. The whole-mirror bundle then carries only what a's did not.
+    cheval::bundle::create_only(&cfg, &only(&["a"]), &tar("a2.tar"), false, None).unwrap();
+    assert!(!tar("a2.tar").exists());
+    cheval::bundle::create(&cfg.global, &tar("all1.tar"), false, None).unwrap();
+    let listed = files_in(&tar("all1.tar"));
+    assert!(listed.iter().any(|f| f.starts_with("b/pool/")));
+    assert!(!listed.iter().any(|f| f.starts_with("a/")), "a was already sent: {listed:?}");
+    cheval::bundle::apply(&tar("all1.tar"), &fm, false).unwrap();
+    assert!(deb_path(&fm.join("b"), "beta", "1.0").is_file());
+
+    // Both upstreams change. A bundle of b (with its sibling) carries b's change and b's
+    // deletion only; a's files on the far side stay exactly as they were.
+    Fixture { date: "Sun, 02 Aug 2026 10:00:00 UTC", ..Default::default() }.build(
+        &ra,
+        "stable",
+        &[pkg("alpha", "1.1")],
+    );
+    Fixture { date: "Sun, 02 Aug 2026 10:00:00 UTC", ..Default::default() }.build(&rb, "stable", &[pkg("beta", "1.1")]);
+    sync_ok(base.path(), &repos).await;
+    cheval::bundle::create_only(&cfg, &only(&["b", "b-again"]), &tar("b2.tar"), false, None).unwrap();
+    assert!(!files_in(&tar("b2.tar")).iter().any(|f| f.starts_with("a/")));
+    cheval::bundle::apply(&tar("b2.tar"), &fm, false).unwrap();
+    assert!(deb_path(&fm.join("b"), "beta", "1.1").is_file() && !deb_path(&fm.join("b"), "beta", "1.0").exists());
+    assert!(deb_path(&fm.join("a"), "alpha", "1.0").is_file() && deb_path(&fm.join("a"), "apple", "1.0").is_file());
+    assert!(!deb_path(&fm.join("a"), "alpha", "1.1").exists());
+
+    // a's change was not lost by b's bundle: the next whole-mirror bundle brings it, with a's
+    // deletions, and nothing of b again. The far side then verifies in full.
+    cheval::bundle::create(&cfg.global, &tar("all2.tar"), false, None).unwrap();
+    assert!(!files_in(&tar("all2.tar")).iter().any(|f| f.starts_with("b/")));
+    cheval::bundle::apply(&tar("all2.tar"), &fm, false).unwrap();
+    assert!(deb_path(&fm.join("a"), "alpha", "1.1").is_file());
+    assert!(!deb_path(&fm.join("a"), "alpha", "1.0").exists() && !deb_path(&fm.join("a"), "apple", "1.0").exists());
+    let far_cfg: Config =
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{repos}", far.path().to_str().unwrap())).unwrap();
+    assert!(cheval::verify::run(&far_cfg, &[], true).unwrap());
+
+    // --full for one repository resends all of it and nothing else.
+    cheval::bundle::create_only(&cfg, &only(&["a"]), &tar("afull.tar"), true, None).unwrap();
+    let listed = files_in(&tar("afull.tar"));
+    assert!(listed.iter().any(|f| f.starts_with("a/pool/")) && !listed.iter().any(|f| f.starts_with("b/")));
+
+    // A bundle that claims to cover a but carries or deletes files elsewhere is refused or ignored.
+    let forge = |name: &str, entries: &[(&str, &[u8])]| {
+        let p = tar(name);
+        let mut t = tar::Builder::new(std::fs::File::create(&p).unwrap());
+        for (n, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            t.append_data(&mut h, n, *data).unwrap();
+        }
+        t.finish().unwrap();
+        p
+    };
+    let info = br#"{"format":1,"scope":["a"],"repos":["a"]}"#;
+    let stray = forge("stray.tar", &[(".cheval-bundle/info.json", info), ("b/pool/evil.deb", b"x")]);
+    assert!(cheval::bundle::apply(&stray, &fm, false).is_err());
+    assert!(!fm.join("b/pool/evil.deb").exists());
+    let victim = deb_path(&fm.join("b"), "beta", "1.1");
+    let rel = victim.strip_prefix(&fm).unwrap().to_string_lossy().into_owned();
+    let wipe = forge("wipe.tar", &[(".cheval-bundle/info.json", info), (".cheval-bundle/delete", rel.as_bytes())]);
+    cheval::bundle::apply(&wipe, &fm, false).unwrap();
+    assert!(victim.is_file(), "a deletion outside the bundle's directories must be ignored");
+}

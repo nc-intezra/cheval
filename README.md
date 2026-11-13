@@ -54,7 +54,7 @@ terminal UI. A replacement for `apt-mirror` and Refrapt.
 the [releases page](https://github.com/nc-intezra/cheval/releases) and install it:
 
 ```sh
-sudo apt install ./cheval_0.6.0_amd64.deb     # dpkg --print-architecture tells you which
+sudo apt install ./cheval_0.6.1_amd64.deb     # dpkg --print-architecture tells you which
 ```
 
 | Package | For |
@@ -78,8 +78,11 @@ against `SHA256SUMS`.
 ```sh
 cargo build --release
 install -m755 target/release/cheval /usr/local/bin/
-packaging/build-deb.sh target/release/cheval 0.6.0 . dist    # optional: your own .deb
+packaging/build-deb.sh target/release/cheval 0.6.1 . dist    # optional: your own .deb
 ```
+
+The `.deb` installs the manual page: `man cheval`. From a tarball or a source checkout,
+read it with `man ./man/cheval.1`.
 
 ## Quick start
 
@@ -128,7 +131,7 @@ See [`examples/cheval.toml`](examples/cheval.toml) for every option.
 | `import FILE…` | Convert `sources.list`, deb822 `.sources`, apt-mirror `mirror.list`, Refrapt config |
 | `sources --base-url URL [--deb822]` | Client configuration for the mirror |
 | `snapshot create [NAME] \| list \| delete NAME` | Hard-linked point-in-time copies |
-| `bundle create OUT.tar [--full] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap |
+| `bundle create OUT.tar [--only NAME]… [--full] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap, for the whole mirror or single repositories |
 | `daemon [--run-on-start]` | Stay up: run syncs on `[daemon] schedule`, keep status streams and the HTTP API alive |
 | `status listen [URL] [--http ADDR] [--forward URL]… [--hmac-key-file FILE]` | Receive the status stream on the far side of a diode: progress screen and HTTP API |
 | `check`, `example` | Validate configuration, print the template |
@@ -300,6 +303,22 @@ Bundles are plain tar files ordered so that applying them keeps the destination
 consistent, and they carry deletions. The baseline is `state/bundle-manifest.tsv`; keep
 one `--manifest` per destination if you feed several sites. Apply bundles in order; if
 one is lost, send a `--full` one.
+
+To send single repositories, name them:
+
+```sh
+cheval bundle create /media/usb/debian.tar --only debian
+cheval bundle create /media/usb/gitlab.tar --only gitlab-ee-trixie --only gitlab-runner-debian
+```
+
+- The manifest records what the destination has for the whole mirror, and each bundle
+  updates only its own part. Per-repository and whole-mirror bundles can therefore be
+  mixed in any order: nothing is sent twice and no change is missed.
+- A per-repository bundle only writes and deletes inside that repository's directory on
+  the receiving side. `bundle apply` needs no extra options.
+- Repositories that share a mirror directory (two `[[repo]]` entries on the same
+  upstream URL) share their `pool/`, so they must be named together; cheval says which.
+- `--full --only NAME` resends all of that repository and nothing else.
 
 ## Status reporting, daemon and data diodes
 

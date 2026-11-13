@@ -168,6 +168,10 @@ enum BundleCmd {
         /// Use one manifest per destination site.
         #[arg(long)]
         manifest: Option<PathBuf>,
+        /// Bundle only this repository (repeatable) [default: the whole mirror].
+        /// Repositories that share a directory must be named together
+        #[arg(long = "only", value_name = "NAME")]
+        only: Vec<String>,
     },
     /// Unpack a bundle into the mirror directory of this (offline) side
     Apply {
@@ -415,9 +419,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Bundle { cmd } => {
             match cmd {
-                BundleCmd::Create { out, full, manifest } => {
+                BundleCmd::Create { out, full, manifest, only } => {
                     let cfg = load_config(&cli.config)?;
-                    bundle::create(&cfg.global, &out, full, manifest)?;
+                    bundle::create_only(&cfg, &only, &out, full, manifest)?;
                 }
                 BundleCmd::Apply { bundle: file, to, keep_deleted } => {
                     let dest = match to {

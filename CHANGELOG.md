@@ -1,6 +1,17 @@
 # Changelog
 
-## v0.6.0 (not yet released)
+## v0.6.1 (not yet released)
+
+- `cheval bundle create --only NAME` (repeatable): bundle single repositories instead of
+  the whole mirror. One manifest still records what the destination has; a bundle reads
+  and updates only its own part, so per-repository and whole-mirror bundles can be mixed.
+  Repositories that share a mirror directory must be named together
+- `cheval bundle apply` refuses files, and ignores deletions, outside the directories a
+  per-repository bundle says it covers
+- Manual page `cheval(1)` with examples; installed by the `.deb`, included in the tarballs
+  together with `docs/`
+
+## v0.6.0
 
 Status reporting for monitoring, built for one-way links (data diodes). Mirroring and
 bundle-based file transfer are unchanged.

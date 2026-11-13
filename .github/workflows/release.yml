@@ -75,6 +75,7 @@ jobs:
           mkdir "$name"
           cp "$bin" src/README.md src/LICENSE src/CHANGELOG.md "$name/"
           cp -r src/examples src/contrib "$name/"
+          for extra in man docs; do [ -d "src/$extra" ] && cp -r "src/$extra" "$name/"; done
           tar czf "dist/$name.tar.gz" "$name"
           deb=$(pkg/packaging/build-deb.sh "$bin" "$TAG" src dist ${{ matrix.deb_arch }})
           dpkg-deb --info "$deb"

@@ -1,0 +1,502 @@
+.\" cheval(1) - keep the version below in step with Cargo.toml (a test checks it).
+.TH CHEVAL 1 "2026-11-13" "cheval 0.6.1" "User Commands"
+.\" File names and settings must not be hyphenated.
+.nh
+.SH NAME
+cheval \- consistent, verified APT repository mirroring with a terminal UI
+.SH SYNOPSIS
+.B cheval
+.RB [ \-c
+.IR FILE ]
+.RB [ \-\-logo
+.IR MODE ]
+.I COMMAND
+.RI [ OPTIONS ]
+.SH DESCRIPTION
+.B cheval
+mirrors APT repositories (Debian, Ubuntu and third-party ones such as GitLab, Docker or
+NVIDIA) to a local directory that can be served to clients, online or offline.
+It replaces
+.BR apt\-mirror (1)
+and Refrapt and reads one TOML configuration file.
+.PP
+A mirror is never left half-updated.
+For every suite cheval fetches the signed Release file and the indices into a private
+staging area, downloads and checksums every package the indices reference, and only then
+publishes the suite's
+.I dists/
+tree, with
+.I InRelease
+written last.
+Consequences worth knowing:
+.IP \(bu 2
+During a run, and on a first run for as long as packages are still downloading,
+.I pool/
+fills while
+.I dists/
+is absent or unchanged.
+This is intended.
+.IP \(bu 2
+A suite with a package that could not be fetched is not published and keeps its previous
+state; the run exits with status 1.
+.IP \(bu 2
+Interrupted downloads resume on the next run.
+.IP \(bu 2
+Obsolete files are removed only after every repository sharing a directory completed, and
+never more than
+.B clean_max_percent
+of a tree at once.
+.PP
+The mirror tree is
+.IR base_path /mirror/ host / path ,
+the layout apt-mirror uses, so an existing tree can be adopted.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-c ", " \-\-config " \fIFILE\fR"
+Configuration file.
+Default:
+.BR $CHEVAL_CONFIG ,
+then
+.IR ./cheval.toml ,
+then
+.IR /etc/cheval/cheval.toml .
+.TP
+.BI \-\-logo " MODE"
+.BR auto " (Unicode in a UTF-8 locale, ASCII otherwise),"
+.BR unicode ,
+.BR ascii " or"
+.BR off .
+Also set by
+.BR $CHEVAL_LOGO ;
+the option wins.
+.TP
+.BR \-V ", " \-\-version
+Print the version as one line.
+.TP
+.BR \-h ", " \-\-help
+Help for cheval or for a command.
+.SH COMMANDS
+.SS Mirroring
+.TP
+.B sync \fR[\fIOPTIONS\fR]
+Mirror the configured repositories.
+Shows the terminal UI on a terminal and plain log lines otherwise.
+.RS
+.TP
+.B \-\-dry\-run
+Fetch indices, report what would be downloaded, publish nothing.
+.TP
+.BI \-\-only " NAME"
+Only this repository (repeatable).
+.TP
+.BI \-\-recheck " size" | hash
+Trust existing files whose size matches (default), or re-hash every one.
+.TP
+.BR \-\-no\-clean ", " \-\-force\-clean
+Skip cleaning this run, or clean even above
+.BR clean_max_percent .
+.TP
+.BR \-\-no\-tui ", " \-\-exit\-when\-done ", " \-v
+Plain output; leave the UI when finished; log retries and per-index details.
+.RE
+.TP
+.B daemon \fR[\fB\-\-run\-on\-start\fR]
+Stay up, run syncs on the
+.B [daemon]
+schedule, and keep the status streams and the HTTP API alive between runs.
+.B SIGUSR1
+starts a run now;
+.B SIGTERM
+stops cleanly.
+The configuration is re-read before each run.
+.TP
+.B verify \fR[\fB\-\-full\fR] [\fB\-\-only\fR \fINAME\fR]
+Check the local mirror offline against its signed indices: presence and size, or with
+.B \-\-full
+every checksum.
+.TP
+.B check
+Validate the configuration and show what would be mirrored where.
+.SS Setting up
+.TP
+.B example
+Print an annotated example configuration.
+.TP
+.B probe \fIURL\fR [\fISUITE\fR...]
+Inspect an unknown repository and print a suggested
+.B [[repo]]
+block.
+Options:
+.BI \-\-user\-agent " UA"
+.RB ( apt
+impersonates apt),
+.BI \-\-username " USER" ,
+.BI \-\-password\-env " VAR" ,
+.BR \-\-bearer .
+.TP
+.B import \fR[\fIFILE\fR...]
+Convert
+.IR sources.list ,
+deb822
+.IR *.sources ,
+apt-mirror
+.I mirror.list
+or a Refrapt configuration to cheval TOML.
+Options:
+.BI \-\-base\-path " DIR" ,
+.BI \-\-arch " ARCH" .
+.TP
+.B sources \-\-base\-url \fIURL\fR [\fB\-\-deb822\fR]
+Print the apt sources clients need to use this mirror, served under
+.IR URL .
+.SS Copies and offline transfer
+.TP
+.B snapshot create \fR[\fINAME\fR] | \fBlist\fR | \fBdelete\fR \fINAME\fR
+Hard-linked point-in-time copies of the mirror under
+.IR base_path /snapshots.
+.TP
+.B bundle create \fIOUT.tar\fR [\fB\-\-only\fR \fINAME\fR]... [\fB\-\-full\fR] [\fB\-\-manifest\fR \fIFILE\fR]
+Pack what changed since the previous bundle into a tar file to carry across an air gap.
+The first bundle is complete; later ones hold only changes and deletions.
+.RS
+.TP
+.BI \-\-only " NAME"
+Bundle only this repository (repeatable); default is the whole mirror.
+Repositories that share a mirror directory must be named together.
+Per-repository and whole-mirror bundles can be mixed: one manifest records what the
+destination has, and each bundle updates only its own part.
+.TP
+.B \-\-full
+Ignore the manifest and pack everything in reach.
+.TP
+.BI \-\-manifest " FILE"
+Record of what the destination has (default
+.IR state/bundle\-manifest.tsv ).
+Use one per destination site.
+.RE
+.TP
+.B bundle apply \fIIN.tar\fR [\fB\-\-to\fR \fIDIR\fR] [\fB\-\-keep\-deleted\fR]
+Unpack a bundle into the mirror directory of the offline side.
+Packages are written first and Release files last; apply bundles in the order they were
+made.
+A per-repository bundle cannot write or delete outside its repository's directory.
+.SS Status across a one-way link
+.TP
+.B status listen \fR[\fIURL\fR] [\fIOPTIONS\fR]
+Receive the status stream (default
+.BR udp://0.0.0.0:5515 ;
+.B tcp://
+for a diode TCP proxy), show a read-only progress screen and serve the HTTP API.
+Needs no configuration file.
+.RS
+.TP
+.BI \-\-http " ADDRESS:PORT"
+Serve the read-only HTTP API.
+.TP
+.BI \-\-token\-file " FILE"
+Bearer token clients must send; required when
+.B \-\-http
+is not a loopback address.
+.TP
+.BI \-\-hmac\-key\-file " FILE"
+Accept only messages signed with this key (the sink's
+.BR hmac_key_file ).
+.TP
+.BI \-\-forward " udp://HOST:PORT"
+Pass every accepted message on (repeatable).
+.TP
+.BI \-\-stale\-after " SECONDS"
+Report the sender as stale after this much silence (default 180).
+.TP
+.B \-\-no\-tui
+Print status lines instead of the screen.
+.RE
+.TP
+.BR version ", " about
+Logo, version and build target.
+.SH CONFIGURATION
+One TOML file.
+.B cheval example
+prints every setting with comments; the most used are below.
+.SS [global]
+.TP
+.B base_path
+Everything lives below it:
+.IR mirror/ ,
+.IR staging/ ,
+.IR state/ ,
+.IR snapshots/ ,
+.IR log/ .
+.TP
+.BR threads ", " per_host ", " repo_parallel ", " retries ", " rate_limit
+Download concurrency overall and per upstream host, repositories in parallel, retries per
+file, and a byte-per-second limit such as "20M".
+.TP
+.BR proxy ", " ca_bundle ", " user_agent
+HTTP proxy, extra CA certificates, user agent ("apt" impersonates apt).
+.TP
+.BR architectures ", " source
+Defaults for every repository.
+.TP
+.BR verify " = require | auto | off"
+Signature checking;
+.B auto
+verifies when a repository has a
+.BR keyring .
+.TP
+.BR clean " = delete | report | off, " clean_max_percent ", " by_hash_keep_days
+What to do with obsolete files.
+.TP
+.BR recheck ", " check_valid_until
+Re-hash existing files each run; refuse expired Release files.
+.SS [[repo]]
+.TP
+.BR name ", " url ", " suites ", " components ", " architectures
+What to mirror.
+A suite ending in "/" (for example "./") is a flat repository without a
+.I dists/
+tree.
+.TP
+.BR keyring ", " verify
+OpenPGP keyring for this repository's Release signatures.
+.TP
+.BR include_packages ", " exclude_packages ", " exclude_paths ", " ignore_missing
+Regular expressions: filter by package name or path, or tolerate files the index lists
+but upstream no longer has.
+.TP
+.BR languages ", " installer ", " pdiffs ", " source ", " extra_files
+Optional index and file selection.
+.TP
+.BR mirror_dir ", " enabled ", " user_agent ", " check_valid_until ", " publish_partial
+Per-repository overrides.
+.TP
+.B [repo.auth]
+.BR username ,
+.B password_env
+or
+.BR password_file ,
+.BR bearer ,
+.BR headers ,
+.BR client_cert .
+.SS [daemon]
+.TP
+.B schedule
+Daily local times ("03:17" or "03:17,15:17") or an interval ("6h", "30m").
+.TP
+.B run_on_start
+Also run when the daemon starts.
+.SS [status], [[status.sink]], [status.http]
+Monitoring only; no mirror content is ever sent.
+.TP
+.BR interval_ms ", " heartbeat_secs ", " host
+Progress cadence during a run, idle heartbeat cadence, host name in messages.
+.TP
+.B [[status.sink]]
+.B url
+.RB ( udp://host:port
+or
+.BR tcp://host:port ),
+.B format
+.RB ( json
+or
+.BR syslog ),
+.B repeat
+(send each datagram N times),
+.BR hmac_key_file ,
+.BR facility ,
+.BR syslog_progress_secs .
+Sinks are send-only; a dead one never delays a sync.
+.TP
+.B [status.http]
+.B listen
+(for example "127.0.0.1:8611"),
+.B token
+or
+.BR token_file .
+Endpoints:
+.IR /v1/status ,
+.IR /v1/repos ,
+.IR /v1/events ,
+.IR /v1/stream ,
+.IR /healthz ,
+.IR /metrics .
+.SH EXAMPLES
+Start from the template, check it, see the size, then mirror:
+.PP
+.RS 4
+.EX
+cheval example > /etc/cheval/cheval.toml
+cheval check
+cheval sync \-\-dry\-run
+cheval sync
+.EE
+.RE
+.PP
+A minimal configuration:
+.PP
+.RS 4
+.EX
+[global]
+base_path = "/srv/cheval"
+
+[[repo]]
+name       = "debian"
+url        = "https://deb.debian.org/debian"
+suites     = ["trixie", "trixie\-updates"]
+components = ["main"]
+keyring    = "/usr/share/keyrings/debian\-archive\-keyring.gpg"
+.EE
+.RE
+.PP
+Find out how to mirror an unfamiliar repository, or convert an existing setup:
+.PP
+.RS 4
+.EX
+cheval probe https://packages.gitlab.com/gitlab/gitlab\-ee/debian/trixie
+cheval import /etc/apt/sources.list /etc/apt/sources.list.d/*.sources
+cheval import /etc/apt/mirror.list \-\-base\-path /srv/cheval
+.EE
+.RE
+.PP
+Mirror one repository without the UI, then check every file:
+.PP
+.RS 4
+.EX
+cheval sync \-\-only debian \-\-no\-tui
+cheval verify \-\-full \-\-only debian
+.EE
+.RE
+.PP
+Serve the mirror and point clients at it (any web server on
+.IR base_path /mirror):
+.PP
+.RS 4
+.EX
+cheval sources \-\-base\-url http://mirror.lan \-\-deb822
+.EE
+.RE
+.PP
+Carry the whole mirror, or single repositories, across an air gap:
+.PP
+.RS 4
+.EX
+cheval bundle create /media/usb/all\-2026\-11\-13.tar
+cheval bundle create /media/usb/debian.tar \-\-only debian
+cheval bundle create /media/usb/gitlab.tar \-\-only gitlab\-ee\-trixie \e
+                                           \-\-only gitlab\-runner\-debian
+# on the offline side:
+cheval bundle apply /media/usb/debian.tar
+cheval verify \-\-full
+.EE
+.RE
+.PP
+Keep a point-in-time copy before a risky update:
+.PP
+.RS 4
+.EX
+cheval snapshot create before\-upgrade
+cheval snapshot list
+.EE
+.RE
+.PP
+Run as a daemon and ask it how it is doing:
+.PP
+.RS 4
+.EX
+systemctl enable \-\-now cheval\-daemon
+systemctl kill \-s USR1 cheval\-daemon
+curl \-s http://127.0.0.1:8611/v1/status
+.EE
+.RE
+.PP
+Watch the sending side from the far side of a data diode:
+.PP
+.RS 4
+.EX
+cheval status listen udp://0.0.0.0:5515 \-\-http 127.0.0.1:8611 \e
+       \-\-hmac\-key\-file /etc/cheval/status.key
+.EE
+.RE
+.PP
+Cron instead of the daemon or the systemd timer:
+.PP
+.RS 4
+.EX
+17 3 * * *  cheval \-c /etc/cheval/cheval.toml sync \-\-no\-tui >/dev/null
+.EE
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The run finished but one or more suites failed (they keep their previous state);
+.B verify
+found problems.
+.TP
+.B 2
+Error: bad configuration, another instance holds the lock, I/O failure.
+.TP
+.B 130
+Interrupted.
+.SH ENVIRONMENT
+.TP
+.B CHEVAL_CONFIG
+Configuration file when
+.B \-c
+is not given.
+.TP
+.B CHEVAL_LOGO
+See
+.BR \-\-logo .
+.TP
+.BR http_proxy ", " https_proxy ", " no_proxy
+Used when
+.B global.proxy
+is not set.
+.TP
+.I password_env variables
+Secrets named by
+.B password_env
+in
+.BR [repo.auth] .
+.SH FILES
+.TP
+.I /etc/cheval/cheval.toml
+Default configuration.
+.TP
+.IR base_path /mirror/
+The tree to serve.
+.TP
+.IR base_path /state/last\-run.json
+Result of the last run, for monitoring.
+.TP
+.IR base_path /state/bundle\-manifest.tsv
+What the bundle destination already has.
+.TP
+.IR base_path /log/cheval.log
+Log of every run.
+.TP
+.I /usr/share/doc/cheval/
+README, example configuration, and
+.I status\-stream.md
+(status message, syslog and HTTP API reference).
+.TP
+.IR cheval.service ", " cheval.timer ", " cheval\-daemon.service ", " cheval\-status\-listen.service
+systemd units.
+Enable the timer or the daemon, not both.
+.SH NOTES
+Signature verification does not evaluate key expiry or revocation.
+Filtered packages remain listed in the signed indices.
+Upstreams are HTTP and HTTPS only.
+Without
+.BR hmac_key_file ,
+anything that can send to a status receiver's port can feed it false status.
+.SH SEE ALSO
+.BR apt (8),
+.BR sources.list (5),
+.BR apt\-mirror (1),
+.BR systemctl (1)
+.PP
+Source, releases and issues: https://github.com/nc\-intezra/cheval
