@@ -220,6 +220,15 @@ impl Progress {
         self.logs.lock().unwrap().iter().filter(|l| l.level >= min).cloned().collect()
     }
 
+    /// Log lines added since `cursor` (a value of `log_seq`), and the new cursor.
+    /// Lines that already fell out of the ring buffer are skipped.
+    pub fn logs_since(&self, cursor: u64) -> (Vec<LogLine>, u64) {
+        let logs = self.logs.lock().unwrap();
+        let total = self.log_seq.load(Ordering::Relaxed);
+        let fresh = (total.saturating_sub(cursor) as usize).min(logs.len());
+        (logs.iter().skip(logs.len() - fresh).cloned().collect(), total)
+    }
+
     pub fn begin(&self, repo: usize, name: String, size: Option<u64>) -> (u64, Arc<AtomicU64>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let done = Arc::new(AtomicU64::new(0));

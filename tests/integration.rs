@@ -858,3 +858,528 @@ async fn offline_bundles_round_trip() {
     assert!(cheval::bundle::apply(&evil, &far.path().join("mirror"), false).is_err());
     assert!(!far.path().join("escape").exists());
 }
+
+// ---------------------------------------------------------------- status stream (v0.6.0)
+
+use cheval::status::{Body, Hub, MAX_DATAGRAM, Message, Reporter};
+use std::time::{Duration, Instant};
+
+/// Collect datagrams arriving on a fresh loopback UDP port.
+async fn udp_collector() -> (u16, Arc<Mutex<Vec<String>>>) {
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let port = sock.local_addr().unwrap().port();
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let sink = got.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = sock.recv_from(&mut buf).await {
+            sink.lock().unwrap().push(String::from_utf8_lossy(&buf[..n]).into_owned());
+        }
+    });
+    (port, got)
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !cond() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn status_config(base: &Path, repos: &str, status: &str) -> Arc<Config> {
+    let text = format!(
+        "[global]\nbase_path = {:?}\nretry_delay_ms = 5\nretries = 3\nstall_timeout_secs = 5\n{repos}\n{status}",
+        base.to_str().unwrap()
+    );
+    let cfg: Config = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    cfg.validate().unwrap();
+    Arc::new(cfg)
+}
+
+/// What `cheval sync` does when sinks are configured.
+async fn sync_reported(cfg: Arc<Config>) -> (Summary, Arc<Hub>) {
+    let names: Vec<String> = cfg.repos.iter().map(|r| r.name.clone()).collect();
+    let progress = Progress::new(&names);
+    let hub = Hub::new(&cfg.status).unwrap();
+    let reporter = Reporter::spawn(hub.clone(), progress.clone(), false);
+    let summary = sync::run(cfg, SyncOptions::default(), progress, CancellationToken::new()).await.unwrap();
+    reporter.finish_with(Some(&summary), None).await;
+    hub.close(Duration::from_secs(2)).await;
+    (summary, hub)
+}
+
+async fn http_get(addr: std::net::SocketAddr, request: &str) -> (u16, String) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(request.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out)).await;
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let code = text.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
+    (code, body)
+}
+
+fn get(path: &str, token: Option<&str>) -> String {
+    let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    format!("GET {path} HTTP/1.1\r\nHost: x\r\n{auth}\r\n")
+}
+
+fn three_packages(up: &Path) {
+    Fixture::default().build(
+        &up.join("repo"),
+        "stable",
+        &[pkg("alpha", "1.0"), pkg("beta", "2.0"), pkg("gamma", "3.0")],
+    );
+}
+
+#[tokio::test]
+async fn status_stream_reports_a_sync_as_json_and_syslog() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    let srv = serve(up.path().to_path_buf()).await;
+    let (json_port, json) = udp_collector().await;
+    let (syslog_port, syslog) = udp_collector().await;
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!(
+            "[status]\ninterval_ms = 200\nhost = \"mirror01\"\n\
+             [[status.sink]]\nurl = \"udp://127.0.0.1:{json_port}\"\nformat = \"json\"\n\
+             [[status.sink]]\nurl = \"udp://127.0.0.1:{syslog_port}\"\nformat = \"syslog\"\nfacility = \"local3\"\n"
+        ),
+    );
+    let (summary, hub) = sync_reported(cfg).await;
+    assert!(summary.success());
+    assert_eq!(hub.dropped(), 0);
+    wait_for("the end message", || json.lock().unwrap().iter().filter(|d| d.contains("\"type\":\"end\"")).count() == 3)
+        .await;
+
+    let datagrams = json.lock().unwrap().clone();
+    let msgs: Vec<Message> = datagrams
+        .iter()
+        .map(|d| {
+            assert!(d.len() <= MAX_DATAGRAM, "{} byte datagram", d.len());
+            serde_json::from_str(d).unwrap_or_else(|e| panic!("{e}: {d}"))
+        })
+        .collect();
+    // One session, one run, sequence numbers without gaps (the end message is sent three times).
+    assert!(msgs.iter().all(|m| m.v == 1 && m.host == "mirror01" && m.sid == msgs[0].sid && m.run == msgs[0].run));
+    assert!(msgs[0].run.starts_with('r') && msgs[0].run.ends_with('Z'));
+    let mut seqs: Vec<u64> = msgs.iter().map(|m| m.seq).collect();
+    seqs.dedup();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    assert!(matches!(msgs[0].body, Body::Run(_)), "progress is the first thing sent");
+
+    let last_repo =
+        msgs.iter().rev().find_map(|m| if let Body::Repo(r) = &m.body { Some(r.clone()) } else { None }).unwrap();
+    assert_eq!((last_repo.name.as_str(), last_repo.phase.as_str()), ("t", "done"));
+    assert_eq!((last_repo.suites_ok, last_repo.suites_failed), (Some(1), Some(0)));
+    // Packages and the index files fetched for them.
+    let fetched = summary.repos[0].files_fetched;
+    assert!(fetched >= 3);
+    assert_eq!(last_repo.files_fetched, fetched);
+    assert!(last_repo.bytes_done > 0 && last_repo.bytes_done == last_repo.bytes_total);
+    let published = msgs.iter().any(
+        |m| matches!(&m.body, Body::Event(e) if e.kind == "suite_ok" && e.repo == "t" && e.text.contains("published")),
+    );
+    assert!(published, "suite publication is reported as an event");
+    let Body::End(end) = &msgs.last().unwrap().body else { panic!("the stream ends with `end`") };
+    assert_eq!(
+        (end.state.as_str(), end.exit_code, end.repos_ok, end.repos_failed, end.files_fetched),
+        ("finished", 0, 1, 0, fetched)
+    );
+
+    // last-run.json carries the same object.
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(base.path().join("state/last-run.json")).unwrap()).unwrap();
+    assert_eq!(state["end"]["state"], "finished");
+    assert_eq!(state["end"]["files_fetched"], fetched);
+
+    // Syslog: RFC 5424, local3 (19) -> info 158; no per-repository lines; one line per datagram.
+    wait_for("the syslog end line", || syslog.lock().unwrap().iter().any(|l| l.contains(" end - "))).await;
+    let lines = syslog.lock().unwrap().clone();
+    let shape =
+        regex::Regex::new(r"^<1(58|56|55)>1 \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ mirror01 cheval \d+ (run|event|end) - \S")
+            .unwrap();
+    for l in &lines {
+        assert!(shape.is_match(l) && !l.contains('\n'), "{l}");
+    }
+    assert!(lines.iter().any(|l| l.contains(" event - [t] suite stable published")), "{lines:#?}");
+    assert!(lines.iter().any(|l| l.contains(" end - sync finished in ") && l.contains("1 repos ok, 0 failed")));
+    assert_eq!(lines.iter().filter(|l| l.contains(" run - ")).count(), 1, "progress lines are rate-limited");
+}
+
+#[tokio::test]
+async fn failed_suite_is_reported_with_exit_code_1() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    std::fs::remove_file(deb_path(&up.path().join("repo"), "beta", "2.0")).unwrap();
+    let srv = serve(up.path().to_path_buf()).await;
+    let (port, json) = udp_collector().await;
+    let (sys_port, syslog) = udp_collector().await;
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!(
+            "[status]\ninterval_ms = 200\n[[status.sink]]\nurl = \"udp://127.0.0.1:{port}\"\n\
+             [[status.sink]]\nurl = \"udp://127.0.0.1:{sys_port}\"\nformat = \"syslog\"\n"
+        ),
+    );
+    let (summary, _) = sync_reported(cfg).await;
+    assert!(!summary.success());
+    wait_for("end", || json.lock().unwrap().iter().any(|d| d.contains("\"type\":\"end\""))).await;
+    let msgs: Vec<Message> = json.lock().unwrap().iter().map(|d| serde_json::from_str(d).unwrap()).collect();
+    let end = msgs.iter().find_map(|m| if let Body::End(e) = &m.body { Some(e.clone()) } else { None }).unwrap();
+    assert_eq!((end.state.as_str(), end.exit_code, end.repos_failed), ("failed", 1, 1));
+    assert_eq!(end.failed, vec!["t"]);
+    assert!(end.files_failed >= 1);
+    assert!(msgs.iter().any(|m| matches!(&m.body, Body::Event(e) if e.level == "error" && e.kind == "suite_failed")));
+    assert!(msgs.iter().any(|m| matches!(&m.body, Body::Repo(r) if r.phase == "failed" && r.suites_failed == Some(1))));
+    wait_for("syslog end", || syslog.lock().unwrap().iter().any(|l| l.contains(" end - "))).await;
+    let lines = syslog.lock().unwrap().clone();
+    // local0.err = 131
+    assert!(
+        lines.iter().any(|l| l.starts_with("<131>1 ") && l.contains(" end - sync finished WITH ERRORS")),
+        "{lines:#?}"
+    );
+}
+
+#[tokio::test]
+async fn receiver_converges_despite_loss_and_rejects_unsigned_messages() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    let srv = serve(up.path().to_path_buf()).await;
+    let key = base.path().join("status.key");
+    std::fs::write(&key, "a-shared-secret-of-decent-length\n").unwrap();
+
+    let (fwd_port, forwarded) = udp_collector().await;
+    let listener = cheval::listen::bind(cheval::listen::Options {
+        listen: "udp://127.0.0.1:0".into(),
+        http: Some("127.0.0.1:0".parse().unwrap()),
+        token: None,
+        forward: vec![format!("udp://127.0.0.1:{fwd_port}")],
+        hmac_key: Some(cheval::status::read_key(&key).unwrap()),
+        stale_after: Duration::from_secs(60),
+        print: false,
+    })
+    .await
+    .unwrap();
+    let (store, rx_addr, http) = (listener.store.clone(), listener.local, listener.http_local.unwrap());
+    let stop = CancellationToken::new();
+    tokio::spawn(listener.run(stop.clone()));
+
+    // A "diode" that loses every third datagram.
+    let lossy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let lossy_port = lossy.local_addr().unwrap().port();
+    let relayed = Arc::new(Mutex::new((0u32, 0u32)));
+    let counts = relayed.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, _)) = lossy.recv_from(&mut buf).await {
+            let seen = {
+                let mut c = counts.lock().unwrap();
+                c.0 += 1;
+                c.0
+            };
+            if seen % 3 != 0 {
+                lossy.send_to(&buf[..n], rx_addr).await.unwrap();
+                counts.lock().unwrap().1 += 1;
+            }
+        }
+    });
+
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!(
+            "[status]\ninterval_ms = 200\n[[status.sink]]\nurl = \"udp://127.0.0.1:{lossy_port}\"\nhmac_key_file = {:?}\n",
+            key.to_str().unwrap()
+        ),
+    );
+    let (summary, _) = sync_reported(cfg).await;
+    assert!(summary.success());
+    wait_for("the receiver to see the end of the run", || matches!(store.status().map(|m| m.body), Some(Body::End(_))))
+        .await;
+
+    // The receiver ends up with the true final state although a third of the stream is gone.
+    let Some(Body::End(end)) = store.status().map(|m| m.body) else { unreachable!() };
+    let fetched = summary.repos[0].files_fetched;
+    assert_eq!((end.state.as_str(), end.repos_ok, end.files_fetched), ("finished", 1, fetched));
+    let repos = store.repos();
+    let Body::Repo(r) = &repos[0].body else { panic!() };
+    assert_eq!((repos.len(), r.name.as_str(), r.phase.as_str(), r.files_fetched), (1, "t", "done", fetched));
+    let rx = store.rx();
+    assert!(rx.lost >= 1, "loss must be noticed: {rx:?}");
+    assert_eq!(rx.bad_mac, 0);
+
+    // Forgeries and unsigned messages are counted and change nothing.
+    let attacker = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let forged = r#"{"v":1,"sid":"evil","seq":1,"ts":"2026-01-01T00:00:00Z","host":"x","type":"end","state":"failed","exit_code":1}"#;
+    attacker.send_to(forged.as_bytes(), rx_addr).await.unwrap();
+    attacker
+        .send_to(format!("{},\"mac\":\"{}\"}}", &forged[..forged.len() - 1], "0".repeat(64)).as_bytes(), rx_addr)
+        .await
+        .unwrap();
+    wait_for("the forgeries to be rejected", || store.rx().bad_mac == 2).await;
+    let Some(Body::End(still)) = store.status().map(|m| m.body) else { panic!() };
+    assert_eq!(still.state, "finished");
+
+    // The receiving side's HTTP API tells the same story, plus what it knows about the link.
+    let (code, body) = http_get(http, &get("/v1/status", None)).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(code, 200);
+    assert_eq!(v["role"], "receiver");
+    assert_eq!(v["status"]["type"], "end");
+    assert_eq!(v["status"]["state"], "finished");
+    assert_eq!(v["receiver"]["stale"], false);
+    assert_eq!(v["receiver"]["bad_mac"], 2);
+    assert!(v["receiver"]["lost"].as_u64().unwrap() >= 1);
+    let (_, body) = http_get(http, &get("/v1/repos/t", None)).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["phase"], "done");
+    let (code, _) = http_get(http, &get("/v1/repos/nope", None)).await;
+    assert_eq!(code, 404);
+    let (_, body) = http_get(http, &get("/metrics", None)).await;
+    assert!(body.contains("cheval_status_stale 0") && body.contains("cheval_last_run_success 1"), "{body}");
+    assert!(body.contains("cheval_status_bad_mac_total 2") && body.contains("cheval_repo_failed{repo=\"t\"} 0"));
+
+    // --forward passes on exactly the accepted datagrams, signature intact.
+    let accepted = store.rx().accepted as usize;
+    wait_for("forwarded copies", || forwarded.lock().unwrap().len() == accepted).await;
+    let key_bytes = cheval::status::read_key(&key).unwrap();
+    assert!(forwarded.lock().unwrap().iter().all(|d| cheval::status::verify(d, &key_bytes).is_some()));
+    assert!(relayed.lock().unwrap().1 as usize >= accepted);
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn dead_or_stuck_status_peers_never_slow_or_fail_the_sync() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    let srv = serve(up.path().to_path_buf()).await;
+    // A TCP peer that accepts and then never reads, one that refuses, and a UDP port nobody listens on.
+    let stuck = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stuck_port = stuck.local_addr().unwrap().port();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let hold = held.clone();
+    tokio::spawn(async move {
+        while let Ok((s, _)) = stuck.accept().await {
+            hold.lock().unwrap().push(s);
+        }
+    });
+    let (refused, nobody) = (free_port(), free_port());
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!(
+            "[status]\ninterval_ms = 200\n\
+             [[status.sink]]\nurl = \"tcp://127.0.0.1:{stuck_port}\"\n\
+             [[status.sink]]\nurl = \"tcp://127.0.0.1:{refused}\"\nformat = \"syslog\"\n\
+             [[status.sink]]\nurl = \"udp://127.0.0.1:{nobody}\"\nrepeat = 3\n\
+             [[status.sink]]\nurl = \"udp://name.that.does.not.resolve.invalid:514\"\nformat = \"syslog\"\n"
+        ),
+    );
+    let started = Instant::now();
+    let (summary, hub) = sync_reported(cfg).await;
+    assert!(summary.success(), "{}", summary.render());
+    assert!(deb_path(&base.path().join("mirror/t"), "alpha", "1.0").is_file());
+    // hub.close waits at most 2 s for the dead sinks; the mirror itself is not held up.
+    assert!(started.elapsed() < Duration::from_secs(8), "took {:?}", started.elapsed());
+    assert!(hub.dropped() > 0, "undeliverable messages are counted");
+    assert_eq!(held.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn tcp_sink_writes_ndjson_and_receiver_reads_it() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    let srv = serve(up.path().to_path_buf()).await;
+    let listener = cheval::listen::bind(cheval::listen::Options {
+        listen: "tcp://127.0.0.1:0".into(),
+        http: None,
+        token: None,
+        forward: vec![],
+        hmac_key: None,
+        stale_after: Duration::from_secs(60),
+        print: false,
+    })
+    .await
+    .unwrap();
+    let (store, addr) = (listener.store.clone(), listener.local);
+    let stop = CancellationToken::new();
+    tokio::spawn(listener.run(stop.clone()));
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!("[status]\ninterval_ms = 200\n[[status.sink]]\nurl = \"tcp://{addr}\"\n"),
+    );
+    let (summary, hub) = sync_reported(cfg).await;
+    assert!(summary.success());
+    assert_eq!(hub.dropped(), 0);
+    wait_for("end over TCP", || matches!(store.status().map(|m| m.body), Some(Body::End(_)))).await;
+    let rx = store.rx();
+    assert_eq!((rx.lost, rx.malformed), (0, 0), "{rx:?}");
+    assert_eq!(rx.duplicates, 2, "the end message is written three times");
+    stop.cancel();
+}
+
+#[tokio::test]
+async fn daemon_runs_then_heartbeats_and_serves_the_api_and_silence_turns_stale() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    three_packages(up.path());
+    let srv = serve(up.path().to_path_buf()).await;
+    let listener = cheval::listen::bind(cheval::listen::Options {
+        listen: "udp://127.0.0.1:0".into(),
+        http: None,
+        token: None,
+        forward: vec![],
+        hmac_key: None,
+        stale_after: Duration::from_millis(2500),
+        print: false,
+    })
+    .await
+    .unwrap();
+    let (far, far_addr) = (listener.store.clone(), listener.local);
+    let far_stop = CancellationToken::new();
+    tokio::spawn(listener.run(far_stop.clone()));
+
+    let api_port = free_port();
+    let api: std::net::SocketAddr = format!("127.0.0.1:{api_port}").parse().unwrap();
+    let cfg = status_config(
+        base.path(),
+        &repo(&srv.url, ""),
+        &format!(
+            "[status]\ninterval_ms = 200\nheartbeat_secs = 1\n\
+             [[status.sink]]\nurl = \"udp://{far_addr}\"\nrepeat = 2\n\
+             [status.http]\nlisten = \"{api}\"\ntoken = \"s3cret-token\"\n"
+        ),
+    );
+    let stop = CancellationToken::new();
+    let reload = cfg.clone();
+    let daemon = tokio::spawn(cheval::daemon::run((*cfg).clone(), move || Ok((*reload).clone()), true, stop.clone()));
+
+    // The run happens, then the daemon settles into heartbeats that remember its result.
+    wait_for(
+        "an idle heartbeat after the run",
+        || matches!(far.status().map(|m| m.body), Some(Body::Heartbeat(h)) if h.last_run.is_some()),
+    )
+    .await;
+    assert!(deb_path(&base.path().join("mirror/t"), "gamma", "3.0").is_file(), "the daemon really mirrored");
+    let Some(Body::Heartbeat(hb)) = far.status().map(|m| m.body) else { unreachable!() };
+    let last = hb.last_run.unwrap();
+    assert_eq!((last.state.as_str(), last.exit_code, last.repos_ok, last.repos_failed), ("finished", 0, 1, 0));
+    assert!(last.run.starts_with('r'));
+    assert_eq!(hb.repos_total, 1);
+    assert!(hb.next_run.is_none(), "no schedule configured");
+    // The fixture's Release is dated 1 Aug 2026; the mirror's copy is that old.
+    assert!(hb.oldest_release_age_s.unwrap() > 86_400);
+    assert!(matches!(far.last_end().map(|m| m.body), Some(Body::End(e)) if e.state == "finished"));
+    let first = far.status().unwrap().seq;
+    wait_for("heartbeats to keep coming", || far.status().is_some_and(|m| m.seq > first + 2)).await;
+    assert!(!far.stale());
+    assert!(far.rx().duplicates > 0 && far.rx().lost == 0, "repeat = 2 arrives twice: {:?}", far.rx());
+    wait_for("the idle repository refresh", || {
+        matches!(far.repo("t").map(|m| m.body), Some(Body::Repo(r)) if r.release_age_s.is_some() && r.phase == "done")
+    })
+    .await;
+
+    // Sender-side API: token required, read-only, same data.
+    let (code, _) = http_get(api, &get("/v1/status", None)).await;
+    assert_eq!(code, 401);
+    let (code, _) = http_get(api, &get("/v1/status", Some("wrong"))).await;
+    assert_eq!(code, 401);
+    let (code, body) = http_get(api, &get("/healthz", None)).await;
+    assert_eq!((code, body.as_str()), (200, "ok\n"));
+    let (code, body) = http_get(api, &get("/v1/status", Some("s3cret-token"))).await;
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["role"], "sender");
+    assert_eq!(v["status"]["type"], "heartbeat");
+    assert_eq!(v["status"]["last_run"]["state"], "finished");
+    assert!(v["last_end"]["files_fetched"].as_u64().unwrap() >= 3);
+    assert_eq!(v["sender"]["sinks"][0]["dropped"], 0);
+    assert!(v["sender"]["sinks"][0]["sent"].as_u64().unwrap() > 5);
+    let (_, body) = http_get(api, &get("/v1/events?since=0", Some("s3cret-token"))).await;
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let events = v["events"].as_array().unwrap();
+    assert!(events.iter().any(|e| e["text"].as_str().unwrap().contains("daemon started")));
+    assert!(events.iter().any(|e| e["kind"] == "suite_ok"));
+    let next = v["next"].as_u64().unwrap();
+    let (_, body) = http_get(api, &get(&format!("/v1/events?since={next}"), Some("s3cret-token"))).await;
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["events"].as_array().unwrap().len(), 0);
+    let (code, _) = http_get(api, &get("/v1/events?since=abc", Some("s3cret-token"))).await;
+    assert_eq!(code, 400);
+    let (code, _) =
+        http_get(api, "POST /v1/status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret-token\r\n\r\n").await;
+    assert_eq!(code, 405);
+    let (code, _) = http_get(api, &get("/v1/nothing", Some("s3cret-token"))).await;
+    assert_eq!(code, 404);
+    let (_, body) = http_get(api, &get("/metrics", Some("s3cret-token"))).await;
+    for want in
+        ["cheval_up 1", "cheval_run_active 0", "cheval_last_run_success 1", "cheval_sink_dropped_total{sink=\"udp://"]
+    {
+        assert!(body.contains(want), "missing {want} in\n{body}");
+    }
+    // /v1/stream delivers live messages as NDJSON.
+    let mut s = tokio::net::TcpStream::connect(api).await.unwrap();
+    s.write_all(get("/v1/stream", Some("s3cret-token")).as_bytes()).await.unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    let until = Instant::now() + Duration::from_secs(10);
+    while !String::from_utf8_lossy(&seen).contains("\"type\":\"heartbeat\"") {
+        assert!(Instant::now() < until, "no heartbeat on /v1/stream");
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&seen).into_owned();
+    assert!(text.starts_with("HTTP/1.1 200 OK") && text.contains("application/x-ndjson"));
+    drop(s);
+
+    // Stop the daemon: it says goodbye, and after the grace period the far side knows it hears nothing.
+    stop.cancel();
+    daemon.await.unwrap().unwrap();
+    wait_for("the goodbye event", || {
+        far.events(0).iter().any(|(_, m)| matches!(&m.body, Body::Event(e) if e.text == "daemon stopping"))
+    })
+    .await;
+    assert!(!far.stale());
+    wait_for("staleness", || far.stale()).await;
+    assert!(far.age().unwrap() >= Duration::from_millis(2500));
+    assert!(tokio::net::TcpStream::connect(api).await.is_err(), "the API is gone with the daemon");
+    far_stop.cancel();
+}
+
+#[test]
+fn status_configuration_is_validated() {
+    let check = |extra: &str| {
+        let text = format!("[global]\nbase_path = \"/x\"\n{extra}");
+        toml::from_str::<Config>(&text).map_err(anyhow::Error::from).and_then(|c| c.validate())
+    };
+    assert!(check("").is_ok());
+    assert!(
+        check("[daemon]\nschedule = \"03:17\"\n[status]\n[[status.sink]]\nurl = \"udp://diode:5514\"\nrepeat = 2\n")
+            .is_ok()
+    );
+    assert!(check("[status.http]\nlisten = \"127.0.0.1:8611\"\n").is_ok());
+    assert!(check("[status.http]\nlisten = \"0.0.0.0:8611\"\ntoken = \"t\"\n").is_ok());
+    for (bad, why) in [
+        ("[status.http]\nlisten = \"0.0.0.0:8611\"\n", "not a loopback"),
+        ("[status.http]\nlisten = \"localhost\"\n", "ADDRESS:PORT"),
+        ("[[status.sink]]\nurl = \"http://x:1\"\n", "udp://"),
+        ("[[status.sink]]\nurl = \"udp://x\"\n", "udp://"),
+        ("[[status.sink]]\nurl = \"udp://x:0\"\n", "port 0"),
+        ("[[status.sink]]\nurl = \"udp://x:1\"\nrepeat = 9\n", "repeat"),
+        ("[[status.sink]]\nurl = \"tcp://x:1\"\nrepeat = 2\n", "repeat"),
+        ("[[status.sink]]\nurl = \"udp://x:1\"\nformat = \"syslog\"\nfacility = \"nope\"\n", "facility"),
+        ("[[status.sink]]\nurl = \"udp://x:1\"\nformat = \"syslog\"\nhmac_key_file = \"/k\"\n", "hmac_key_file"),
+        ("[status]\ninterval_ms = 10\n", "interval_ms"),
+        ("[daemon]\nschedule = \"whenever\"\n", "schedule"),
+    ] {
+        let err = format!("{:#}", check(bad).expect_err(bad));
+        assert!(err.contains(why), "{bad:?} -> {err}");
+    }
+}

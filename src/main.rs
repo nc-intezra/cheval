@@ -2,8 +2,9 @@ use anyhow::{Context, Result, bail};
 use cheval::config::{Config, Recheck, Repo};
 use cheval::logo::{self, LogoMode};
 use cheval::progress::{Level, Progress, format_line};
+use cheval::status::{Hub, Reporter};
 use cheval::sync::{self, SyncOptions};
-use cheval::{bundle, headless, import, probe, snapshot, tui, verify};
+use cheval::{bundle, daemon, headless, import, listen, probe, snapshot, status, tui, verify};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -110,9 +111,49 @@ enum Cmd {
     Check,
     /// Print an annotated example configuration
     Example,
+    /// Run syncs on the configured schedule; keep the status streams and HTTP API up between runs
+    Daemon {
+        /// Start a run immediately, then follow the schedule
+        #[arg(long)]
+        run_on_start: bool,
+    },
+    /// Receive the status stream on the far side of a data diode
+    Status {
+        #[command(subcommand)]
+        cmd: StatusCmd,
+    },
     /// Show the logo, version and build target
     #[command(alias = "about")]
     Version,
+}
+
+#[derive(Subcommand)]
+enum StatusCmd {
+    /// Listen for status messages, show progress and serve the read-only HTTP API.
+    /// Needs no configuration file
+    Listen {
+        /// Where to receive: udp://ADDRESS:PORT, or tcp://ADDRESS:PORT behind a diode TCP proxy
+        #[arg(default_value = "udp://0.0.0.0:5515")]
+        url: String,
+        /// Serve the HTTP API here, e.g. 127.0.0.1:8611
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        http: Option<std::net::SocketAddr>,
+        /// File with the Bearer token HTTP clients must send (required for non-loopback --http)
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<PathBuf>,
+        /// Pass every accepted message on to this udp://HOST:PORT (repeatable)
+        #[arg(long, value_name = "URL")]
+        forward: Vec<String>,
+        /// Shared secret: accept only messages signed with it (the sink's hmac_key_file)
+        #[arg(long, value_name = "FILE")]
+        hmac_key_file: Option<PathBuf>,
+        /// Report the sender as stale after this many seconds of silence
+        #[arg(long, default_value_t = 180, value_name = "SECONDS")]
+        stale_after: u64,
+        /// Print status lines instead of the TUI (automatic when not on a terminal)
+        #[arg(long)]
+        no_tui: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -188,6 +229,57 @@ fn real_main(cli: Cli) -> Result<i32> {
     match cli.cmd {
         Cmd::Example => {
             print!("{}", cheval::config::EXAMPLE);
+            Ok(0)
+        }
+        Cmd::Daemon { run_on_start } => {
+            let cfg = load_config(&cli.config)?;
+            let run_on_start = run_on_start || cfg.daemon.run_on_start;
+            let path = cli.config.clone();
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            rt.block_on(daemon::run(cfg, move || load_config(&path), run_on_start, CancellationToken::new()))?;
+            rt.shutdown_timeout(Duration::from_secs(2));
+            Ok(0)
+        }
+        Cmd::Status {
+            cmd: StatusCmd::Listen { url, http, token_file, forward, hmac_key_file, stale_after, no_tui },
+        } => {
+            if stale_after == 0 {
+                bail!("--stale-after must be at least 1 second");
+            }
+            let use_tui = !no_tui && std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+            let opts = listen::Options {
+                listen: url.clone(),
+                http,
+                token: cheval::config::read_secret(None, token_file.as_deref(), "--token-file")?,
+                forward,
+                hmac_key: hmac_key_file.as_deref().map(status::read_key).transpose()?,
+                stale_after: Duration::from_secs(stale_after),
+                print: !use_tui,
+            };
+            let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+            let listener = rt.block_on(listen::bind(opts))?;
+            let store = listener.store.clone();
+            let signed = if hmac_key_file.is_some() { "signed messages only" } else { "unsigned messages accepted" };
+            eprintln!("cheval status: listening on {url} ({signed})");
+            if let Some(a) = listener.http_local {
+                eprintln!("cheval status: HTTP API on http://{a}");
+            }
+            let stop = CancellationToken::new();
+            let task = rt.spawn(listener.run(stop.clone()));
+            if use_tui {
+                listen::tui(store, &url, logo::resolve(cli.logo)).context("terminal UI")?;
+            } else {
+                rt.block_on(async {
+                    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending().await } } => {}
+                    }
+                });
+            }
+            stop.cancel();
+            let _ = rt.block_on(task);
+            rt.shutdown_timeout(Duration::from_secs(1));
             Ok(0)
         }
         Cmd::Version => {
@@ -371,6 +463,14 @@ fn run_sync(
         None,
         format!("cheval {} starting{}", env!("CARGO_PKG_VERSION"), if opts.dry_run { " (dry run)" } else { "" }),
     );
+    // Status streams (if configured) report this run too; they never slow it down.
+    let reporting = if cfg.status.sinks.is_empty() {
+        None
+    } else {
+        let _in_runtime = rt.enter();
+        let hub = Hub::new(&cfg.status)?;
+        Some((hub.clone(), Reporter::spawn(hub, progress.clone(), opts.dry_run)))
+    };
     let engine = {
         let (cfg, progress, cancel) = (cfg.clone(), progress.clone(), cancel.clone());
         rt.spawn(async move {
@@ -392,6 +492,13 @@ fn run_sync(
         rt.spawn(headless::report(progress.clone(), Duration::from_secs(10)));
     }
     let result = rt.block_on(engine)?;
+    if let Some((hub, reporter)) = reporting {
+        let error = result.as_ref().err().map(|e| format!("{e:#}"));
+        rt.block_on(async {
+            reporter.finish_with(result.as_ref().ok(), error).await;
+            hub.close(Duration::from_secs(2)).await;
+        });
+    }
     rt.shutdown_timeout(Duration::from_secs(2));
     if use_tui {
         // Leave the important lines in the terminal scrollback.

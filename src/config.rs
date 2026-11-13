@@ -215,6 +215,175 @@ pub struct Config {
     pub global: Global,
     #[serde(default, rename = "repo")]
     pub repos: Vec<Repo>,
+    /// Status reporting: one-way UDP/TCP streams and the local HTTP API.
+    #[serde(default)]
+    pub status: Status,
+    /// Settings for `cheval daemon`.
+    #[serde(default)]
+    pub daemon: Daemon,
+}
+
+fn d_interval() -> u64 {
+    2000
+}
+fn d_heartbeat() -> u64 {
+    60
+}
+fn d_repeat() -> u8 {
+    1
+}
+fn d_facility() -> String {
+    "local0".into()
+}
+fn d_syslog_progress() -> u64 {
+    30
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Status {
+    /// How often progress is emitted during a run.
+    #[serde(default = "d_interval")]
+    pub interval_ms: u64,
+    /// How often the daemon reports "alive" between runs.
+    #[serde(default = "d_heartbeat")]
+    pub heartbeat_secs: u64,
+    /// Host name put into every message [default: the system host name].
+    pub host: Option<String>,
+    #[serde(default, rename = "sink")]
+    pub sinks: Vec<Sink>,
+    pub http: Option<HttpApi>,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Status { interval_ms: d_interval(), heartbeat_secs: d_heartbeat(), host: None, sinks: Vec::new(), http: None }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SinkFormat {
+    /// One JSON object per datagram (UDP) or per line (TCP).
+    #[default]
+    Json,
+    /// RFC 5424 syslog lines written for people.
+    Syslog,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Sink {
+    /// `udp://host:port` (preferred) or `tcp://host:port`. Send-only either way.
+    pub url: String,
+    #[serde(default)]
+    pub format: SinkFormat,
+    /// UDP only: send every datagram this many times (loss protection).
+    #[serde(default = "d_repeat")]
+    pub repeat: u8,
+    /// JSON only: file with a shared secret; adds an HMAC-SHA256 `mac` field.
+    pub hmac_key_file: Option<PathBuf>,
+    /// Syslog only: kern, user, daemon, local0 … local7.
+    #[serde(default = "d_facility")]
+    pub facility: String,
+    /// Syslog only: at most one progress line per this many seconds.
+    #[serde(default = "d_syslog_progress")]
+    pub syslog_progress_secs: u64,
+}
+
+impl Sink {
+    /// (is_tcp, "host:port")
+    pub fn target(&self) -> Result<(bool, String)> {
+        let (tcp, addr) = parse_stream_url(&self.url)?;
+        if addr.ends_with(":0") {
+            bail!("{:?}: port 0 is not a destination", self.url);
+        }
+        Ok((tcp, addr))
+    }
+    pub fn facility_code(&self) -> Result<u8> {
+        syslog_facility(&self.facility)
+    }
+}
+
+/// Split `udp://host:port` / `tcp://host:port` into (is_tcp, "host:port"). Port 0 is allowed
+/// here: a listener may ask the system for any free port.
+pub fn parse_stream_url(url: &str) -> Result<(bool, String)> {
+    let (tcp, rest) = if let Some(r) = url.strip_prefix("udp://") {
+        (false, r)
+    } else if let Some(r) = url.strip_prefix("tcp://") {
+        (true, r)
+    } else {
+        bail!("{url:?}: expected udp://host:port or tcp://host:port");
+    };
+    let rest = rest.trim_end_matches('/');
+    let port = rest.rsplit_once(':').map(|(h, p)| (h, p.parse::<u16>()));
+    match port {
+        Some((h, Ok(_))) if !h.is_empty() => Ok((tcp, rest.to_string())),
+        _ => bail!("{url:?}: expected udp://host:port or tcp://host:port"),
+    }
+}
+
+pub fn syslog_facility(name: &str) -> Result<u8> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "kern" => 0,
+        "user" => 1,
+        "daemon" => 3,
+        "auth" => 4,
+        "syslog" => 5,
+        "cron" => 9,
+        l if l.len() == 6 && l.starts_with("local") && l.as_bytes()[5].is_ascii_digit() && l.as_bytes()[5] <= b'7' => {
+            16 + (l.as_bytes()[5] - b'0')
+        }
+        _ => bail!("unknown syslog facility {name:?} (use user, daemon or local0 … local7)"),
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpApi {
+    /// Address of the read-only HTTP API, e.g. "127.0.0.1:8611".
+    pub listen: String,
+    /// Bearer token clients must send. Required when `listen` is not a loopback address.
+    pub token: Option<String>,
+    pub token_file: Option<PathBuf>,
+}
+
+impl HttpApi {
+    pub fn addr(&self) -> Result<std::net::SocketAddr> {
+        self.listen.parse().with_context(|| format!("status.http.listen {:?}: expected ADDRESS:PORT", self.listen))
+    }
+    pub fn token(&self) -> Result<Option<String>> {
+        read_secret(self.token.as_deref(), self.token_file.as_deref(), "status.http.token_file")
+    }
+}
+
+/// A literal secret or the first line of a file.
+pub fn read_secret(literal: Option<&str>, file: Option<&Path>, what: &str) -> Result<Option<String>> {
+    if let Some(t) = literal {
+        return Ok(Some(t.to_string()));
+    }
+    match file {
+        Some(f) => {
+            let text = std::fs::read_to_string(f).with_context(|| format!("{what}: cannot read {}", f.display()))?;
+            let line = text.lines().next().unwrap_or("").trim().to_string();
+            if line.is_empty() {
+                bail!("{what}: {} is empty", f.display());
+            }
+            Ok(Some(line))
+        }
+        None => Ok(None),
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Daemon {
+    /// Daily times ("03:17" or "03:17,15:17", local time) or an interval ("6h", "30m").
+    /// Without a schedule the daemon only runs on SIGUSR1.
+    pub schedule: Option<String>,
+    /// Also start a run as soon as the daemon starts.
+    #[serde(default)]
+    pub run_on_start: bool,
 }
 
 pub struct Filters {
@@ -398,6 +567,38 @@ impl Config {
             {
                 bail!("repo {}: keyring {} does not exist", r.name, k.display());
             }
+        }
+        let st = &self.status;
+        if st.interval_ms < 200 {
+            bail!("status.interval_ms must be at least 200");
+        }
+        if st.heartbeat_secs == 0 {
+            bail!("status.heartbeat_secs must be at least 1");
+        }
+        for k in &st.sinks {
+            let (tcp, _) = k.target().context("status.sink.url")?;
+            if !(1..=5).contains(&k.repeat) {
+                bail!("status.sink {}: repeat must be between 1 and 5", k.url);
+            }
+            if tcp && k.repeat != 1 {
+                bail!("status.sink {}: repeat only applies to udp:// sinks", k.url);
+            }
+            k.facility_code().with_context(|| format!("status.sink {}", k.url))?;
+            if k.format == SinkFormat::Syslog && k.hmac_key_file.is_some() {
+                bail!("status.sink {}: hmac_key_file only applies to format = \"json\"", k.url);
+            }
+        }
+        if let Some(h) = &st.http {
+            let addr = h.addr()?;
+            if h.token.is_some() && h.token_file.is_some() {
+                bail!("status.http: set token or token_file, not both");
+            }
+            if !addr.ip().is_loopback() && h.token.is_none() && h.token_file.is_none() {
+                bail!("status.http.listen {addr} is not a loopback address: set token or token_file");
+            }
+        }
+        if let Some(s) = &self.daemon.schedule {
+            crate::daemon::Schedule::parse(s).context("daemon.schedule")?;
         }
         Ok(())
     }

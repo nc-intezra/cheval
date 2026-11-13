@@ -261,12 +261,12 @@ pub async fn run(
         }
     }
     summary.elapsed = started.elapsed();
-    write_state(&g, &summary);
+    write_state(&g, &summary, &progress);
     progress.finished.store(true, Ordering::Relaxed);
     Ok(summary)
 }
 
-fn write_state(g: &Global, s: &Summary) {
+fn write_state(g: &Global, s: &Summary, p: &Progress) {
     let repos: Vec<serde_json::Value> = s
         .repos
         .iter()
@@ -286,6 +286,8 @@ fn write_state(g: &Global, s: &Summary) {
         "elapsed_secs": s.elapsed.as_secs(),
         "cleaned_files": s.cleaned_files, "cleaned_bytes": s.cleaned_bytes,
         "repos": repos,
+        // The same object the status stream sends as its `end` message.
+        "end": crate::status::EndMsg::from_summary(s, p),
     });
     let path = g.state_path().join("last-run.json");
     let _ = std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap_or_default());
