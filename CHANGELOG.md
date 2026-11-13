@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Releases now include a `.deb` package (static binary, systemd units, example
+  configuration) and a `SHA256SUMS` file; the release workflow can be re-run for
+  an existing tag
+
 ## v0.5.0 — 2026-11-12
 
 First release.

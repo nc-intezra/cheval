@@ -1,31 +1,60 @@
 name: release
+# Runs when a v* tag is pushed. Can also be started by hand for an existing tag
+# (Actions → release → Run workflow) to rebuild and re-attach its artifacts.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach artifacts to (e.g. v0.5.0)"
+        required: true
 permissions:
   contents: write
 jobs:
-  static-binary:
+  artifacts:
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET: x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          path: src
+      - name: Check out packaging scripts
+        uses: actions/checkout@v4
+        with:
+          path: pkg
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo test
-      - run: cargo build --release --target x86_64-unknown-linux-musl
-      - name: Package
+      - name: Check that the tag matches the crate version
+        working-directory: src
         run: |
-          name="cheval-${GITHUB_REF_NAME}-x86_64-linux-musl"
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $v"; exit 1; }
+      - run: cargo test
+        working-directory: src
+      - run: cargo build --release --target "$TARGET"
+        working-directory: src
+      - name: Package tar.gz and .deb
+        run: |
+          mkdir dist
+          name="cheval-${TAG}-x86_64-linux-musl"
           mkdir "$name"
-          cp target/x86_64-unknown-linux-musl/release/cheval README.md LICENSE CHANGELOG.md "$name/"
-          cp -r examples contrib "$name/"
-          tar czf "$name.tar.gz" "$name"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          cp "src/target/$TARGET/release/cheval" src/README.md src/LICENSE src/CHANGELOG.md "$name/"
+          cp -r src/examples src/contrib "$name/"
+          tar czf "dist/$name.tar.gz" "$name"
+          deb=$(pkg/packaging/build-deb.sh "src/target/$TARGET/release/cheval" "$TAG" src dist amd64)
+          dpkg-deb --info "$deb"
+          sudo dpkg -i "$deb" && cheval --version && sudo dpkg -r cheval
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "cheval $GITHUB_REF_NAME" --notes "See CHANGELOG.md"
-          gh release upload "$GITHUB_REF_NAME" cheval-*.tar.gz cheval-*.sha256 --clobber
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "cheval $TAG" --notes "See CHANGELOG.md"
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/* --clobber

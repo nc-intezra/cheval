@@ -35,12 +35,30 @@ terminal UI. A replacement for `apt-mirror` and Refrapt.
 
 ## Install
 
+**Debian / Ubuntu (amd64):** download `cheval_<version>_amd64.deb` from the
+[releases page](https://github.com/nc-intezra/cheval/releases) and
+
 ```sh
-cargo build --release        # Rust 1.89 or newer
-install -m755 target/release/cheval /usr/local/bin/
+sudo apt install ./cheval_0.5.0_amd64.deb
 ```
 
-The binary is self-contained (rustls for TLS; xz/zstd/bzip2 are compiled in).
+The package contains a statically linked binary (no library dependencies, works on
+any release), the example configuration in `/usr/share/doc/cheval/examples/`, an
+empty `/etc/cheval/`, and a systemd service and timer that are installed but **not
+enabled**. It creates an unprivileged `cheval` system user for that service; give
+that user ownership of your `base_path` before enabling the timer
+(`systemctl enable --now cheval.timer`).
+
+**Other systems:** the release also carries a static `tar.gz`. Check either download
+against `SHA256SUMS`.
+
+**From source** (Rust 1.89 or newer):
+
+```sh
+cargo build --release
+install -m755 target/release/cheval /usr/local/bin/
+packaging/build-deb.sh target/release/cheval 0.5.0 . dist    # optional: your own .deb
+```
 
 ## Quick start
 
