@@ -35,12 +35,18 @@ terminal UI. A replacement for `apt-mirror` and Refrapt.
 
 ## Install
 
-**Debian / Ubuntu (amd64):** download `cheval_<version>_amd64.deb` from the
-[releases page](https://github.com/nc-intezra/cheval/releases) and
+**Debian / Ubuntu / Raspberry Pi OS:** download the `.deb` for your architecture from
+the [releases page](https://github.com/nc-intezra/cheval/releases) and install it:
 
 ```sh
-sudo apt install ./cheval_0.5.0_amd64.deb
+sudo apt install ./cheval_0.5.0_amd64.deb     # dpkg --print-architecture tells you which
 ```
+
+| Package | For |
+|---|---|
+| `cheval_<version>_amd64.deb` | 64-bit x86 PCs and servers |
+| `cheval_<version>_arm64.deb` | 64-bit ARM: Raspberry Pi 3/4/5 with a 64-bit OS, ARM servers |
+| `cheval_<version>_armhf.deb` | 32-bit ARM: every Raspberry Pi (including Pi 1 and Zero) on 32-bit Raspberry Pi OS, and Debian/Ubuntu armhf. Built for ARMv6 hard-float. |
 
 The package contains a statically linked binary (no library dependencies, works on
 any release), the example configuration in `/usr/share/doc/cheval/examples/`, an
@@ -49,7 +55,7 @@ enabled**. It creates an unprivileged `cheval` system user for that service; giv
 that user ownership of your `base_path` before enabling the timer
 (`systemctl enable --now cheval.timer`).
 
-**Other systems:** the release also carries a static `tar.gz`. Check either download
+**Other systems:** the release also carries a static `tar.gz` per architecture. Check either download
 against `SHA256SUMS`.
 
 **From source** (Rust 1.89 or newer):

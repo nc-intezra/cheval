@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Releases now include a `.deb` package (static binary, systemd units, example
+- Releases now include `.deb` packages for amd64, arm64 and armhf (static binary, systemd units, example
   configuration) and a `SHA256SUMS` file; the release workflow can be re-run for
   an existing tag
 

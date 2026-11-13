@@ -11,12 +11,35 @@ on:
         required: true
 permissions:
   contents: write
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 jobs:
-  artifacts:
+  test:
     runs-on: ubuntu-latest
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
-      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check that the tag matches the crate version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $v"; exit 1; }
+      - run: cargo test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl binaries: no library dependencies on the target system.
+          - { deb_arch: amd64, target: x86_64-unknown-linux-musl,   label: x86_64,  qemu: "" }
+          - { deb_arch: arm64, target: aarch64-unknown-linux-musl,  label: aarch64, qemu: "qemu-aarch64-static" }
+          # ARMv6 hard-float: runs on every Raspberry Pi (1, Zero, 2, 3, 4, 5) under
+          # Raspberry Pi OS armhf as well as on Debian/Ubuntu armhf (ARMv7).
+          - { deb_arch: armhf, target: arm-unknown-linux-musleabihf, label: armv6hf, qemu: "qemu-arm-static -cpu arm1176" }
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@v4
@@ -28,33 +51,55 @@ jobs:
         with:
           path: pkg
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - name: Check that the tag matches the crate version
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build
         working-directory: src
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Smoke test the binary
         run: |
-          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match Cargo.toml version $v"; exit 1; }
-      - run: cargo test
-        working-directory: src
-      - run: cargo build --release --target "$TARGET"
-        working-directory: src
+          bin="src/target/${{ matrix.target }}/release/cheval"
+          file "$bin"
+          if [ -n "${{ matrix.qemu }}" ]; then
+            sudo apt-get update && sudo apt-get install -y qemu-user-static
+            ${{ matrix.qemu }} "$bin" --version
+            ${{ matrix.qemu }} "$bin" example > /dev/null
+          else
+            "$bin" --version
+          fi
       - name: Package tar.gz and .deb
         run: |
+          bin="src/target/${{ matrix.target }}/release/cheval"
           mkdir dist
-          name="cheval-${TAG}-x86_64-linux-musl"
+          name="cheval-${TAG}-${{ matrix.label }}-linux-musl"
           mkdir "$name"
-          cp "src/target/$TARGET/release/cheval" src/README.md src/LICENSE src/CHANGELOG.md "$name/"
+          cp "$bin" src/README.md src/LICENSE src/CHANGELOG.md "$name/"
           cp -r src/examples src/contrib "$name/"
           tar czf "dist/$name.tar.gz" "$name"
-          deb=$(pkg/packaging/build-deb.sh "src/target/$TARGET/release/cheval" "$TAG" src dist amd64)
+          deb=$(pkg/packaging/build-deb.sh "$bin" "$TAG" src dist ${{ matrix.deb_arch }})
           dpkg-deb --info "$deb"
-          sudo dpkg -i "$deb" && cheval --version && sudo dpkg -r cheval
-          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          if [ "${{ matrix.deb_arch }}" = amd64 ]; then
+            sudo dpkg -i "$deb" && cheval --version && sudo dpkg -r cheval
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.deb_arch }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
           gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "cheval $TAG" --notes "See CHANGELOG.md"
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" dist/* --clobber
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" * --clobber
+          # Superseded by SHA256SUMS.
+          gh release delete-asset "$TAG" "cheval-${TAG}-x86_64-linux-musl.tar.gz.sha256" -R "$GITHUB_REPOSITORY" -y 2>/dev/null || true
