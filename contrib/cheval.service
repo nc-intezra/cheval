@@ -1,0 +1,20 @@
+[Unit]
+Description=cheval APT mirror sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=cheval
+ExecStart=/usr/local/bin/cheval -c /etc/cheval/cheval.toml sync --no-tui
+# Secrets referenced by password_env live here (mode 0600):
+EnvironmentFile=-/etc/cheval/secrets.env
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/srv/cheval

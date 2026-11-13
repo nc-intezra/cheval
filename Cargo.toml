@@ -1,0 +1,52 @@
+[package]
+name = "cheval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Consistent, verified APT repository mirroring with a terminal UI"
+license = "MIT"
+repository = "https://github.com/nc-intezra/cheval"
+readme = "README.md"
+keywords = ["apt", "mirror", "debian", "ubuntu", "tui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+bzip2 = "0.6.1"
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.11"
+futures-util = "0.3.34"
+hex = "0.4.3"
+liblzma = { version = "0.4.9", features = ["static"] }
+md-5 = "0.11.0"
+percent-encoding = "2.3.2"
+pgp = "0.21.1"
+ratatui = "0.30.2"
+regex = "1.13.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "socks"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+sha2 = "0.11.1"
+tar = "0.4.46"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal", "net"] }
+tokio-util = "0.7.20"
+toml = "1.2.1"
+url = "2.5.8"
+walkdir = "2.5.0"
+zstd = "0.14.4"
+
+[dev-dependencies]
+flate2 = "1.1.11"
+hex = "0.4.3"
+liblzma = "0.4.9"
+percent-encoding = "2.3.2"
+sha2 = "0.11.1"
+tar = "0.4.46"
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true

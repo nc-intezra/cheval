@@ -1,0 +1,112 @@
+# cheval example configuration.  Run: cheval -c cheval.toml sync
+
+[global]
+# Everything lives below base_path:
+#   mirror/     the tree you serve (same layout as apt-mirror: mirror/<host>/<path>)
+#   staging/    private work area for indices that are not yet published
+#   state/      lock file and last-run.json (for monitoring)
+#   snapshots/  hard-linked point-in-time copies (`cheval snapshot create`)
+#   log/        cheval.log
+base_path = "/srv/cheval"
+
+threads       = 16         # simultaneous downloads overall
+per_host      = 8          # simultaneous downloads per upstream host
+repo_parallel = 4          # repositories processed at the same time
+retries       = 5          # per file, exponential back-off, honours Retry-After
+# rate_limit  = "20M"      # bytes per second across all transfers
+# proxy       = "http://proxy.example:3128"   # default: http_proxy / https_proxy / no_proxy
+# ca_bundle   = "/etc/ssl/corp-ca.pem"        # extra CAs (TLS-inspecting proxy, private CA)
+# user_agent  = "apt"      # impersonate apt for servers that reject unknown agents
+
+architectures = ["amd64"]  # default for every repo
+source        = false      # also mirror source packages
+
+verify  = "auto"           # "require" | "auto" (verify when a keyring is set) | "off"
+clean   = "delete"         # "delete" | "report" | "off"
+recheck = "size"           # "size" | "hash" (re-hash every existing file each run)
+clean_max_percent = 40     # refuse to delete more than this share of a tree at once
+by_hash_keep_days = 3      # keep superseded by-hash indices for clients mid-update
+check_valid_until = true   # refuse expired Release files
+
+# --- A standard distribution archive -------------------------------------------------
+[[repo]]
+name       = "debian"
+url        = "https://deb.debian.org/debian"
+suites     = ["trixie", "trixie-updates"]
+components = ["main", "contrib", "non-free-firmware"]
+architectures = ["amd64", "arm64"]
+keyring    = "/usr/share/keyrings/debian-archive-keyring.gpg"
+
+[[repo]]
+name       = "debian-security"
+url        = "https://security.debian.org/debian-security"
+suites     = ["trixie-security"]
+components = ["main", "contrib", "non-free-firmware"]
+keyring    = "/usr/share/keyrings/debian-archive-keyring.gpg"
+
+[[repo]]
+name       = "ubuntu"
+url        = "http://archive.ubuntu.com/ubuntu"
+suites     = ["noble", "noble-updates", "noble-security"]
+components = ["main", "restricted", "universe", "multiverse"]
+keyring    = "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+# languages = ["en"]                 # only these Translation-* files
+# installer = true                   # debian-installer udebs
+# pdiffs    = true                   # Packages.diff/ directories
+
+# --- GitLab (packages.gitlab.com, 2026 layout) -----------------------------------------
+# gitlab-ee / gitlab-ce: ONE repository PER distribution, codename is part of the URL.
+# Package downloads redirect to storage.googleapis.com: allow it in your proxy/firewall.
+[[repo]]
+name       = "gitlab-ee-trixie"
+url        = "https://packages.gitlab.com/gitlab/gitlab-ee/debian/trixie"
+suites     = ["trixie"]
+components = ["main"]
+keyring    = "/etc/cheval/keys/gitlab.gpg"     # https://packages.gitlab.com/gpgkey/gpg.key
+extra_files = ["gpgkey/gpg.key"]               # ship the key with the mirror (best effort)
+# Keep only recent major versions (regex on package name is also available):
+# exclude_paths = ['gitlab-ee_1[0-7]\.']
+
+# gitlab-runner: one repository per OS holding every distribution.
+[[repo]]
+name       = "gitlab-runner-debian"
+url        = "https://packages.gitlab.com/runner/gitlab-runner/debian"
+suites     = ["trixie", "bookworm"]
+components = ["main"]
+keyring    = "/etc/cheval/keys/gitlab.gpg"
+
+# --- Flat repository (no dists/ tree): suite ends with "/" -------------------------------
+[[repo]]
+name   = "nvidia-cuda"
+url    = "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64"
+suites = ["./"]
+keyring = "/etc/cheval/keys/cuda-archive-keyring.gpg"
+
+# --- Authenticated repositories ----------------------------------------------------------
+[[repo]]
+name    = "private-artifactory"
+enabled = false
+url     = "https://artifactory.example.com/artifactory/debian-local"
+suites  = ["stable"]
+components = ["main"]
+verify  = "off"
+  [repo.auth]
+  username     = "mirror-bot"
+  password_env = "ARTIFACTORY_TOKEN"     # or password_file = "/etc/cheval/secret"
+  # bearer = true                        # send the secret as "Authorization: Bearer ..."
+  # headers = { "X-JFrog-Art-Api" = "..." }
+  # client_cert = "/etc/cheval/client.pem"   # mutual TLS (certificate + key, PEM)
+
+# --- Tuning a troublesome upstream --------------------------------------------------------
+[[repo]]
+name    = "vendor-with-quirks"
+enabled = false
+url     = "https://packages.example.com/apt"
+suites  = ["stable"]
+components = ["main"]
+user_agent = "apt"                        # server rejects unknown user agents
+ignore_missing = ['pool/main/o/old-thing/'] # listed in the index but gone upstream
+exclude_packages = ['-dbg(sym)?$']          # skip debug packages
+check_valid_until = false                 # vendor forgets to refresh Valid-Until
+# mirror_dir = "vendor/apt"               # override the on-disk location
+# publish_partial = true                  # publish even when some packages failed
