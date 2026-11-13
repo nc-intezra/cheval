@@ -1,5 +1,20 @@
 # cheval
 
+```
+╔══════════════════════════════════════════════════════╗
+║                                                      ║
+║            ██╗                                 ██╗   ║
+║            ██║                                 ██║   ║
+║    ██████╗ ██████╗   ██████╗ ██╗   ██╗ █████╗  ██║   ║
+║   ██╔════╝ ██╔══██╗ ██╔═══██╗██║   ██║██╔══██╗ ██║   ║
+║   ██║      ██║  ██║ ████████║██║   ██║███████║ ██║   ║
+║   ██║      ██║  ██║ ██╔═════╝╚██╗ ██╔╝██╔══██║ ██║   ║
+║   ╚██████╗ ██║  ██║ ╚███████╗ ╚████╔╝ ██║  ██║ ██║   ║
+║    ╚═════╝ ╚═╝  ╚═╝  ╚══════╝  ╚═══╝  ╚═╝  ╚═╝ ╚═╝   ║
+║                                                      ║
+╚══════════════════════════════════════════════════════╝
+```
+
 A fast, consistent, verifiable **APT repository mirror** written in Rust, with a
 terminal UI. A replacement for `apt-mirror` and Refrapt.
 
@@ -115,6 +130,7 @@ See [`examples/cheval.toml`](examples/cheval.toml) for every option.
 | `snapshot create [NAME] \| list \| delete NAME` | Hard-linked point-in-time copies |
 | `bundle create OUT.tar [--full] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap |
 | `check`, `example` | Validate configuration, print the template |
+| `version` (alias `about`) | Logo, version and build target (`--version` stays a single machine-readable line) |
 
 Exit codes: `0` success, `1` one or more suites failed (previous state kept), `2`
 usage/configuration error, `130` interrupted. `state/last-run.json` holds a machine-readable
@@ -127,6 +143,18 @@ summary for monitoring; `log/cheval.log` the full log.
 After the run the screen stays until `q`/`Enter` (`--exit-when-done` to leave at once).
 Without a terminal (cron, systemd, pipes) cheval prints log lines and a status line
 every 10 seconds instead.
+
+### Logo
+
+The TUI shows the cheval mark when the terminal is big enough to spare the room: the
+framed block logo above the progress screen from 34 rows, the four-row title-bar
+version from 26 rows, and nothing on a classic 80×24 terminal. The version is always
+shown at the right of the footer when it fits. `cheval version` prints the framed
+stencil logo.
+
+Where the locale is not UTF-8 (or `TERM=dumb`), cheval draws an ASCII-only version of
+the block logo instead. Override the choice with `--logo auto|unicode|ascii|off` or
+`CHEVAL_LOGO`; the flag wins.
 
 ## How a run works
 

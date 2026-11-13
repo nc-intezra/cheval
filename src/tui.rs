@@ -1,4 +1,5 @@
 //! Terminal user interface (ratatui).
+use crate::logo::{self, Charset};
 use crate::progress::{Level, Phase, Progress};
 use crate::util::{human_bytes, human_duration};
 use ratatui::DefaultTerminal;
@@ -23,6 +24,69 @@ struct State {
     min_level: Level,
     quit_presses: u8,
     final_elapsed: Option<Duration>,
+    /// Logo 1 (header) and logo 3 (title bar) in the chosen character set.
+    banner: Vec<String>,
+    compact: Option<Vec<String>>,
+}
+
+/// Rows the rest of the screen needs before a logo may take any.
+const BODY_MIN_ROWS: u16 = 22;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Header {
+    Full,
+    Compact,
+    None,
+}
+
+/// Pick the biggest logo that still leaves room for the progress screen.
+/// `banner` and `compact` are (rows, columns) of the available renderings.
+fn choose_header(rows: u16, cols: u16, banner: (u16, u16), compact: Option<(u16, u16)>) -> Header {
+    if banner.0 > 0 && rows >= banner.0 + BODY_MIN_ROWS && cols >= banner.1 {
+        Header::Full
+    } else if let Some((h, w)) = compact
+        && rows >= h + BODY_MIN_ROWS
+        && cols >= w
+    {
+        Header::Compact
+    } else {
+        Header::None
+    }
+}
+
+fn logo_size(lines: &[String]) -> (u16, u16) {
+    (lines.len() as u16, lines.first().map_or(0, |l| logo::width(l)) as u16)
+}
+
+/// Colour a logo: fill characters bright, extrusion and frame dim.
+fn logo_lines(lines: &[String]) -> Vec<Line<'static>> {
+    let fill = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let dim = Style::new().fg(Color::DarkGray);
+    lines
+        .iter()
+        .map(|l| {
+            let mut spans: Vec<Span> = Vec::new();
+            let mut run = String::new();
+            let mut cur = Style::new();
+            for c in l.chars() {
+                // Blanks continue whatever run they are in, so lines are not split into many spans.
+                let st = match c {
+                    '█' | '▀' | '▄' | '#' => fill,
+                    ' ' => cur,
+                    _ => dim,
+                };
+                if st != cur && !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), cur));
+                }
+                cur = st;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                spans.push(Span::styled(run, cur));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// Run the UI until the engine finished and the user leaves, or the user aborts.
@@ -32,9 +96,10 @@ pub fn run(
     cancel: CancellationToken,
     title: &str,
     exit_when_done: bool,
+    logo: Charset,
 ) -> std::io::Result<()> {
     let mut term = ratatui::try_init()?;
-    let res = ui_loop(&mut term, &progress, &cancel, title, exit_when_done);
+    let res = ui_loop(&mut term, &progress, &cancel, title, exit_when_done, logo);
     ratatui::restore();
     res
 }
@@ -45,6 +110,7 @@ fn ui_loop(
     cancel: &CancellationToken,
     title: &str,
     exit_when_done: bool,
+    logo: Charset,
 ) -> std::io::Result<()> {
     let mut st = State {
         speeds: VecDeque::from(vec![0; 120]),
@@ -55,6 +121,8 @@ fn ui_loop(
         min_level: Level::Info,
         quit_presses: 0,
         final_elapsed: None,
+        banner: logo::banner(logo),
+        compact: logo::compact(logo),
     };
     loop {
         let finished = progress.finished.load(Ordering::Relaxed);
@@ -148,6 +216,18 @@ fn trunc_left(s: &str, max: usize) -> String {
 
 fn draw(f: &mut ratatui::Frame, p: &Progress, st: &State, title: &str, finished: bool, cancelling: bool) {
     let area = f.area();
+    let kind = choose_header(area.height, area.width, logo_size(&st.banner), st.compact.as_deref().map(logo_size));
+    let logo_rows = match kind {
+        Header::Full => st.banner.len() as u16,
+        Header::Compact => st.compact.as_ref().map_or(0, |c| c.len() as u16),
+        Header::None => 0,
+    };
+    let [logo_a, area] = Layout::vertical([Constraint::Length(logo_rows), Constraint::Min(0)]).areas(area);
+    match kind {
+        Header::Full => draw_logo(f, logo_a, &st.banner, 3, title),
+        Header::Compact => draw_logo(f, logo_a, st.compact.as_deref().unwrap_or_default(), 1, title),
+        Header::None => {}
+    }
     let repo_h = (p.repos.len() as u16 + 3).min(area.height / 3).max(4);
     let active_n = p.active.lock().unwrap().len() as u16;
     let active_h = (active_n + 2).clamp(3, (area.height / 4).max(3));
@@ -323,7 +403,43 @@ fn draw(f: &mut ratatui::Frame, p: &Progress, st: &State, title: &str, finished:
     } else {
         " q q: stop · ↑↓ PgUp PgDn: scroll log · f: follow · e: warnings only · v: verbose "
     };
-    f.render_widget(Paragraph::new(help).style(Style::new().fg(Color::Black).bg(Color::Gray)), foot);
+    let bar_style = Style::new().fg(Color::Black).bg(Color::Gray);
+    // Version notifier: right-aligned in the footer whenever it fits beside the key help.
+    let ver = format!(" cheval {} ", logo::VERSION);
+    if foot.width as usize >= logo::width(help) + logo::width(&ver) {
+        let [help_a, ver_a] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(logo::width(&ver) as u16)]).areas(foot);
+        f.render_widget(Paragraph::new(help).style(bar_style), help_a);
+        f.render_widget(Paragraph::new(ver).style(bar_style.add_modifier(Modifier::BOLD)), ver_a);
+    } else {
+        f.render_widget(Paragraph::new(help).style(bar_style), foot);
+    }
+}
+
+/// Draw a logo at the left of `area`, with the version and run title beside it when there is room.
+fn draw_logo(f: &mut ratatui::Frame, area: Rect, lines: &[String], info_row: u16, title: &str) {
+    let (_, w) = logo_size(lines);
+    f.render_widget(Paragraph::new(logo_lines(lines)), Rect { width: w.min(area.width), ..area });
+    const INFO_W: u16 = 26;
+    if area.width >= w + 2 + INFO_W {
+        let info = Rect {
+            x: area.x + w + 2,
+            y: area.y + info_row.min(area.height.saturating_sub(3)),
+            width: area.width - w - 2,
+            height: 3.min(area.height),
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("cheval {}", logo::VERSION),
+                    Style::new().add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::raw(title.to_string())),
+                Line::from(Span::styled(logo::TAGLINE, Style::new().add_modifier(Modifier::DIM))),
+            ]),
+            info,
+        );
+    }
 }
 
 fn draw_log(f: &mut ratatui::Frame, p: &Progress, st: &State, area: Rect) {
@@ -365,4 +481,91 @@ fn draw_log(f: &mut ratatui::Frame, p: &Progress, st: &State, area: Rect) {
         if scroll > 0 { format!(" · scrolled {scroll}") } else { String::new() }
     );
     f.render_widget(Paragraph::new(text).block(Block::bordered().title(title)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_follows_the_terminal_size() {
+        let full = (12, 56);
+        let compact = Some((4, 64));
+        // Big terminal: the framed block logo.
+        assert_eq!(choose_header(50, 120, full, compact), Header::Full);
+        assert_eq!(choose_header(34, 56, full, compact), Header::Full);
+        // Not tall enough for the block logo, but the title bar fits.
+        assert_eq!(choose_header(33, 120, full, compact), Header::Compact);
+        assert_eq!(choose_header(26, 64, full, compact), Header::Compact);
+        // The classic 80x24 terminal keeps the whole screen for progress.
+        assert_eq!(choose_header(24, 80, full, compact), Header::None);
+        // Too narrow for the block logo falls through to the next size, then to nothing.
+        assert_eq!(choose_header(50, 55, full, compact), Header::None);
+        // ASCII fallback has no title bar; logo off has neither.
+        assert_eq!(choose_header(30, 120, full, None), Header::None);
+        assert_eq!(choose_header(50, 120, (0, 0), None), Header::None);
+    }
+
+    #[test]
+    fn logo_colouring_keeps_every_character() {
+        for cs in [Charset::Unicode, Charset::Ascii] {
+            let lines = logo::banner(cs);
+            let styled = logo_lines(&lines);
+            for (plain, line) in lines.iter().zip(&styled) {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(&text, plain);
+            }
+        }
+    }
+
+    fn state(cs: Charset) -> State {
+        State {
+            speeds: VecDeque::from(vec![0; 120]),
+            last_bytes: 0,
+            last_sample: Instant::now(),
+            speed: 0.0,
+            scroll: 0,
+            min_level: Level::Info,
+            quit_presses: 0,
+            final_elapsed: None,
+            banner: logo::banner(cs),
+            compact: logo::compact(cs),
+        }
+    }
+
+    fn render(cols: u16, rows: u16, cs: Charset) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let p = Progress::new(&["ubuntu".to_string(), "debian".to_string()]);
+        let st = state(cs);
+        let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        term.draw(|f| draw(f, &p, &st, "/srv/cheval -> /srv/cheval/mirror", false, false)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..rows)
+            .map(|y| (0..cols).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn screens_at_three_sizes() {
+        let big = render(120, 50, Charset::Unicode);
+        println!("{big}\n");
+        assert!(big.contains("██╗"), "block logo missing");
+        assert!(big.contains("cheval 0.5.0") && big.contains("apt mirroring"), "info column missing");
+        assert!(big.lines().last().unwrap().contains("cheval 0.5.0"), "footer version missing");
+
+        let mid = render(110, 30, Charset::Unicode);
+        println!("{mid}\n");
+        assert!(mid.contains("▀▀") && !mid.contains("██╗"), "title bar expected");
+
+        let small = render(80, 24, Charset::Unicode);
+        println!("{small}\n");
+        assert!(!small.contains("▀▀") && !small.contains("██╗"), "no logo expected at 80x24");
+        assert!(small.contains("Repositories"));
+
+        let ascii = render(120, 50, Charset::Ascii);
+        println!("{ascii}\n");
+        assert!(ascii.contains("##+") && !ascii.contains("██╗"));
+    }
 }

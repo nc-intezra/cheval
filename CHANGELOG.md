@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Logo: framed block logo in the README and in the TUI header (terminals of 34+ rows),
+  four-row stencil in the TUI title bar (26+ rows), the version in the TUI footer, and
+  `cheval version` (alias `about`) for the stencil and build target. ASCII-only
+  fallback where the locale is not UTF-8; `--logo auto|unicode|ascii|off` and
+  `CHEVAL_LOGO` override it. `--version` output is unchanged
 - Releases now include `.deb` packages for amd64, arm64 and armhf (static binary, systemd units, example
   configuration) and a `SHA256SUMS` file; the release workflow can be re-run for
   an existing tag

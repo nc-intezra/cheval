@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use cheval::config::{Config, Recheck, Repo};
+use cheval::logo::{self, LogoMode};
 use cheval::progress::{Level, Progress, format_line};
 use cheval::sync::{self, SyncOptions};
 use cheval::{bundle, headless, import, probe, snapshot, tui, verify};
@@ -17,6 +18,9 @@ struct Cli {
     /// Configuration file [default: $CHEVAL_CONFIG, ./cheval.toml, /etc/cheval/cheval.toml]
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
+    /// Logo: auto (UTF-8 locale -> Unicode, else ASCII), unicode, ascii or off [env: CHEVAL_LOGO]
+    #[arg(long, global = true, value_enum, value_name = "MODE")]
+    logo: Option<LogoMode>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -106,6 +110,9 @@ enum Cmd {
     Check,
     /// Print an annotated example configuration
     Example,
+    /// Show the logo, version and build target
+    #[command(alias = "about")]
+    Version,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +188,15 @@ fn real_main(cli: Cli) -> Result<i32> {
     match cli.cmd {
         Cmd::Example => {
             print!("{}", cheval::config::EXAMPLE);
+            Ok(0)
+        }
+        Cmd::Version => {
+            for l in logo::about(logo::resolve(cli.logo)) {
+                println!("{l}");
+            }
+            println!("cheval {} ({}-{})", logo::VERSION, std::env::consts::ARCH, std::env::consts::OS);
+            println!("{}", logo::TAGLINE);
+            println!("{}", env!("CARGO_PKG_REPOSITORY"));
             Ok(0)
         }
         Cmd::Import { files, base_path, arch } => {
@@ -313,12 +329,19 @@ fn real_main(cli: Cli) -> Result<i32> {
                 bail!("the configuration defines no [[repo]] entries");
             }
             let opts = SyncOptions { dry_run, recheck, only, no_clean, force_clean };
-            run_sync(cfg, opts, no_tui, exit_when_done, verbose)
+            run_sync(cfg, opts, no_tui, exit_when_done, verbose, logo::resolve(cli.logo))
         }
     }
 }
 
-fn run_sync(cfg: Arc<Config>, opts: SyncOptions, no_tui: bool, exit_when_done: bool, verbose: bool) -> Result<i32> {
+fn run_sync(
+    cfg: Arc<Config>,
+    opts: SyncOptions,
+    no_tui: bool,
+    exit_when_done: bool,
+    verbose: bool,
+    logo: logo::Charset,
+) -> Result<i32> {
     let names: Vec<String> = cfg.repos.iter().map(|r| r.name.clone()).collect();
     let progress = Progress::new(&names);
     progress.verbose.store(verbose, Ordering::Relaxed);
@@ -361,7 +384,7 @@ fn run_sync(cfg: Arc<Config>, opts: SyncOptions, no_tui: bool, exit_when_done: b
     };
     if use_tui {
         let title = format!("{} → {}", cfg.global.base_path.display(), cfg.global.mirror_path().display());
-        tui::run(progress.clone(), cancel.clone(), &title, exit_when_done).context("terminal UI")?;
+        tui::run(progress.clone(), cancel.clone(), &title, exit_when_done, logo).context("terminal UI")?;
         if !progress.finished.load(Ordering::Relaxed) {
             cancel.cancel();
         }

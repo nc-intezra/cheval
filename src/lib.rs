@@ -6,6 +6,7 @@ pub mod deb822;
 pub mod headless;
 pub mod http;
 pub mod import;
+pub mod logo;
 pub mod plan;
 pub mod probe;
 pub mod progress;
