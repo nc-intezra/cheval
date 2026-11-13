@@ -246,6 +246,12 @@ pub async fn run(
     while !stop.is_cancelled() {
         let next = schedule.as_ref().map(|s| s.next(Local::now(), last_start));
         if !run_now {
+            // A manual `cheval sync` between daemon runs counts as the last run too.
+            if let Some(disk) = last_run_from_state(&cfg)
+                && last.as_ref().is_none_or(|l| disk.finished_at > l.finished_at)
+            {
+                last = Some(disk);
+            }
             idle.heartbeat(&hub, &cfg, &last, next).await;
             let until_run = next.map(|n| (n - Local::now()).to_std().unwrap_or_default());
             let nap = until_run.map_or(hub.heartbeat, |u| u.min(hub.heartbeat));
@@ -272,6 +278,8 @@ pub async fn run(
         }
         last_start = Local::now();
         let (run, end) = run_once(cfg.clone(), hub.clone(), SyncOptions::default(), stop.child_token()).await;
+        // Requests that arrived while the run was in flight are satisfied by that run.
+        while tokio::time::timeout(Duration::ZERO, usr1.recv()).await.is_ok() {}
         last = Some(LastRun {
             run,
             state: end.state,

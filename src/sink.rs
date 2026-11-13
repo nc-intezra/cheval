@@ -32,6 +32,7 @@ struct Encoder {
     key: Option<Vec<u8>>,
     progress_every: Duration,
     last_progress: Option<Instant>,
+    last_seq: u64,
     pid: u32,
 }
 
@@ -44,6 +45,11 @@ impl Encoder {
                 None => w.json.clone(),
             });
         }
+        // Repeats exist for lossy datagram paths; in a log they would only be duplicate lines.
+        if w.msg.seq <= self.last_seq {
+            return None;
+        }
+        self.last_seq = w.msg.seq;
         if let Body::Run(_) = w.msg.body {
             // A log server wants a progress line now and then, not every two seconds.
             if self.last_progress.is_some_and(|t| t.elapsed() < self.progress_every) {
@@ -68,6 +74,7 @@ pub async fn run(
         key,
         progress_every: spec.progress_every,
         last_progress: None,
+        last_seq: 0,
         pid: std::process::id(),
     };
     let mut udp = Udp { addr: spec.addr.clone(), target: None, resolved: None, socket: None };
@@ -113,7 +120,9 @@ struct Udp {
 impl Udp {
     async fn send(&mut self, data: &[u8]) -> bool {
         // Re-resolve now and then so a changed DNS record is picked up without a restart.
-        if self.target.is_none() || self.resolved.is_none_or(|t| t.elapsed() > RESOLVE_EVERY) {
+        // A name that does not resolve is retried every few seconds, not once per message.
+        let every = if self.target.is_none() { Duration::from_secs(5) } else { RESOLVE_EVERY };
+        if self.resolved.is_none_or(|t| t.elapsed() > every) {
             self.resolved = Some(Instant::now());
             if let Ok(Ok(mut addrs)) = tokio::time::timeout(TCP_TIMEOUT, tokio::net::lookup_host(&self.addr)).await
                 && let Some(a) = addrs.next()

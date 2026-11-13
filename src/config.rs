@@ -568,6 +568,11 @@ impl Config {
                 bail!("repo {}: keyring {} does not exist", r.name, k.display());
             }
         }
+        self.validate_status()
+    }
+
+    /// The `[status]` and `[daemon]` sections.
+    pub fn validate_status(&self) -> Result<()> {
         let st = &self.status;
         if st.interval_ms < 200 {
             bail!("status.interval_ms must be at least 200");
@@ -624,6 +629,23 @@ mod tests {
         assert_eq!(Repo::dist_dir("noble").unwrap(), PathBuf::from("dists/noble"));
         assert!(Repo::dist_dir("../x").is_err());
     }
+    #[test]
+    fn commented_status_example_is_valid() {
+        // The daemon/status block ships commented out; make sure it still parses when enabled.
+        let at = EXAMPLE.find("# --- Daemon:").expect("daemon section in the example");
+        let setting = Regex::new(r"^# (\[|[a-z_]+\s*=)").unwrap();
+        let enabled: String =
+            EXAMPLE[at..].lines().filter(|l| setting.is_match(l)).map(|l| &l[2..]).collect::<Vec<_>>().join("\n");
+        let text = format!("{}\n{enabled}", &EXAMPLE[..at]);
+        let cfg: Config = toml::from_str(&text).unwrap_or_else(|e| panic!("{e}\n{enabled}"));
+        cfg.validate_status().unwrap();
+        assert_eq!(cfg.daemon.schedule.as_deref(), Some("03:17"));
+        assert_eq!(cfg.status.sinks.len(), 3);
+        assert_eq!(cfg.status.sinks[2].format, SinkFormat::Syslog);
+        assert_eq!(cfg.status.sinks[1].repeat, 2);
+        assert_eq!(cfg.status.http.unwrap().listen, "127.0.0.1:8611");
+    }
+
     #[test]
     fn url_credentials_are_stripped() {
         let cfg: Config = toml::from_str("[global]\nbase_path = \"/x\"\n[[repo]]\nname = \"a\"\nurl = \"https://u:p%40ss@h.example:8443/r\"\nsuites = [\"s\"]\n").unwrap();

@@ -552,8 +552,11 @@ mod tests {
         let big = render(120, 50, Charset::Unicode);
         println!("{big}\n");
         assert!(big.contains("██╗"), "block logo missing");
-        assert!(big.contains("cheval 0.5.0") && big.contains("apt mirroring"), "info column missing");
-        assert!(big.lines().last().unwrap().contains("cheval 0.5.0"), "footer version missing");
+        assert!(
+            big.contains(&format!("cheval {}", logo::VERSION)) && big.contains("apt mirroring"),
+            "info column missing"
+        );
+        assert!(big.lines().last().unwrap().contains(&format!("cheval {}", logo::VERSION)), "footer version missing");
 
         let mid = render(110, 30, Charset::Unicode);
         println!("{mid}\n");

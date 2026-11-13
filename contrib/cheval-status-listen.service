@@ -1,0 +1,28 @@
+# Receiving side of the status stream (the far side of a data diode).
+# Needs no cheval.toml. Change the options with `systemctl edit cheval-status-listen`:
+#
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/cheval status listen udp://0.0.0.0:5515 --http 127.0.0.1:8611 \
+#             --hmac-key-file /etc/cheval/status.key --forward udp://siem.lan:5514 --no-tui
+[Unit]
+Description=cheval status receiver (progress and HTTP API from the one-way status stream)
+After=network.target
+
+[Service]
+Type=simple
+User=cheval
+ExecStart=/usr/local/bin/cheval status listen udp://0.0.0.0:5515 --http 127.0.0.1:8611 --no-tui
+Restart=on-failure
+RestartSec=5
+# Hardening: this service reads datagrams and serves HTTP; it writes no files.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

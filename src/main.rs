@@ -338,6 +338,28 @@ fn real_main(cli: Cli) -> Result<i32> {
                     r.clean(g),
                 );
             }
+            if let Some(s) = &cfg.daemon.schedule {
+                println!("daemon schedule: {s}{}", if cfg.daemon.run_on_start { " (and at start)" } else { "" });
+            }
+            for k in &cfg.status.sinks {
+                println!(
+                    "status sink: {} ({}{}{})",
+                    k.url,
+                    if k.format == cheval::config::SinkFormat::Json { "json" } else { "syslog" },
+                    if k.repeat > 1 { format!(", sent {} times", k.repeat) } else { String::new() },
+                    if k.hmac_key_file.is_some() { ", signed" } else { "" },
+                );
+                if let Some(f) = &k.hmac_key_file {
+                    status::read_key(f)?;
+                }
+            }
+            if let Some(h) = &cfg.status.http {
+                println!(
+                    "status HTTP API (daemon): http://{}{}",
+                    h.addr()?,
+                    if h.token()?.is_some() { " (bearer token required)" } else { "" }
+                );
+            }
             Ok(0)
         }
         Cmd::Sources { base_url, deb822 } => {

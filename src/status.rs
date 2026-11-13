@@ -28,6 +28,7 @@ pub const MAX_DATAGRAM: usize = 1200;
 /// JSON budget before the optional `mac` field (10 + 64 bytes) is appended.
 const MAX_BODY: usize = MAX_DATAGRAM - 80;
 const EVENT_RING: usize = 500;
+const MAX_REPOS: usize = 4096;
 const SINK_QUEUE: usize = 512;
 
 // ------------------------------------------------------------------------------- schema
@@ -219,6 +220,49 @@ pub fn now_ts() -> String {
 }
 
 impl Message {
+    /// Make a message from the network safe to print and store: no control characters (they
+    /// could carry terminal escape sequences) and no oversized strings.
+    pub fn sanitize(&mut self) {
+        fn fix(s: &mut String, max: usize) {
+            if s.len() > max || s.chars().any(|c| c.is_control()) {
+                *s = clip(&clean(s), max);
+            }
+        }
+        for s in [&mut self.sid, &mut self.run, &mut self.ts, &mut self.host] {
+            fix(s, 64);
+        }
+        match &mut self.body {
+            Body::Run(r) => fix(&mut r.state, 32),
+            Body::Repo(r) => {
+                fix(&mut r.name, 96);
+                fix(&mut r.phase, 32);
+            }
+            Body::Event(e) => {
+                fix(&mut e.level, 16);
+                fix(&mut e.kind, 32);
+                fix(&mut e.repo, 96);
+                fix(&mut e.text, 1000);
+            }
+            Body::End(e) => {
+                fix(&mut e.state, 32);
+                fix(&mut e.error, 1000);
+                e.failed.truncate(64);
+                e.failed.iter_mut().for_each(|f| fix(f, 96));
+            }
+            Body::Heartbeat(h) => {
+                fix(&mut h.state, 32);
+                if let Some(n) = &mut h.next_run {
+                    fix(n, 40);
+                }
+                if let Some(l) = &mut h.last_run {
+                    fix(&mut l.run, 64);
+                    fix(&mut l.state, 32);
+                    fix(&mut l.finished_at, 40);
+                }
+            }
+        }
+    }
+
     /// Serialize to JSON no longer than the datagram budget, shortening free text if necessary.
     pub fn to_json(&self) -> String {
         let mut m = self.clone();
@@ -329,7 +373,7 @@ impl Message {
                 let last = match &h.last_run {
                     Some(l) if l.state == "finished" => format!("last run {} ok", l.finished_at),
                     Some(l) => format!(
-                        "last run {} {} ({} repos failed)",
+                        "last run {} {} (repos failed: {})",
                         l.finished_at,
                         l.state.to_uppercase(),
                         l.repos_failed
@@ -499,6 +543,10 @@ impl Store {
                 }
             }
             Body::Repo(r) => {
+                // Bounded memory even if someone floods an unauthenticated receiver with names.
+                if s.repos.len() >= MAX_REPOS && !s.repos.contains_key(&r.name) {
+                    return;
+                }
                 s.repos.insert(r.name.clone(), (msg.clone(), now));
                 // Repositories removed from the sender's configuration stop being refreshed.
                 s.repos.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(86_400));
@@ -541,13 +589,14 @@ impl Store {
             },
             None => text.to_string(),
         };
-        let msg: Message = match serde_json::from_str(&json) {
+        let mut msg: Message = match serde_json::from_str(&json) {
             Ok(m) => m,
             Err(_) => {
                 bump(|r| r.malformed += 1);
                 return Ingest::Malformed;
             }
         };
+        msg.sanitize();
         {
             let mut s = self.inner.lock().unwrap();
             s.rx.received += 1;
@@ -1360,6 +1409,44 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         assert!(store.stale());
         assert!(!Store::new(None).stale(), "a sender is never stale");
+    }
+
+    #[test]
+    fn hostile_input_is_defused_and_bounded() {
+        let store = Store::new(Some(Duration::from_secs(60)));
+        let evil = r#"{"v":1,"sid":"s","seq":1,"ts":"t","host":"h\u001b[2J","type":"event","level":"info","kind":"log","repo":"r\u0007","text":"\u001b]0;pwned\u0007 hello\r\n"}"#;
+        assert_eq!(store.ingest(evil.as_bytes(), None), Ingest::Accepted);
+        let (_, m) = store.events(0).pop().unwrap();
+        let Body::Event(e) = &m.body else { panic!() };
+        assert!(!format!("{}{}{}", m.host, e.repo, e.text).chars().any(|c| c.is_control()));
+        assert!(e.text.contains("hello"));
+        // Numbers at the limit do not panic anywhere on the way to a screen or a log line.
+        let max = u64::MAX;
+        let run = format!(
+            r#"{{"v":1,"sid":"s","seq":2,"ts":"t","host":"h","type":"run","state":"running","bytes_total":{max},"bytes_done":{max},"files_fetched":{max},"files_present":{max},"eta_s":{max},"elapsed_s":{max},"speed_bps":{max}}}"#
+        );
+        assert_eq!(store.ingest(run.as_bytes(), None), Ingest::Accepted);
+        assert!(store.status().unwrap().human().is_some());
+        // A jump to the largest sequence number is counted as loss without overflowing.
+        let far = format!(r#"{{"v":1,"sid":"s","seq":{max},"ts":"t","host":"h","type":"repo","name":"a"}}"#);
+        assert_eq!(store.ingest(far.as_bytes(), None), Ingest::Accepted);
+        assert_eq!(store.ingest(far.as_bytes(), None), Ingest::Duplicate);
+        // Repository names cannot grow the store without limit.
+        let flood = Store::new(Some(Duration::from_secs(60)));
+        for i in 1..=(MAX_REPOS as u64 + 50) {
+            let m = format!(r#"{{"v":1,"sid":"f","seq":{i},"ts":"t","host":"h","type":"repo","name":"n{i}"}}"#);
+            flood.ingest(m.as_bytes(), None);
+        }
+        assert_eq!(flood.repos().len(), MAX_REPOS);
+        // Wrong types and unknown message types are rejected, not guessed at.
+        for bad in [
+            r#"{"v":1,"sid":"s","seq":"x","ts":"t","host":"h","type":"run"}"#,
+            r#"{"v":1,"sid":"s","seq":9,"ts":"t","host":"h","type":"nope"}"#,
+            "[]",
+            "{}",
+        ] {
+            assert_eq!(store.ingest(bad.as_bytes(), None), Ingest::Malformed, "{bad}");
+        }
     }
 
     #[test]

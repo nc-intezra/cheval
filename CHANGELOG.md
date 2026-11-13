@@ -1,7 +1,24 @@
 # Changelog
 
-## Unreleased
+## v0.6.0 (not yet released)
 
+Status reporting for monitoring, built for one-way links (data diodes). Mirroring and
+bundle-based file transfer are unchanged.
+
+- `cheval daemon`: runs syncs on `[daemon] schedule` (daily times or an interval), starts
+  a run on SIGUSR1, re-reads the configuration before each run, sends heartbeats between
+  runs. New unit `cheval-daemon.service`
+- Status sinks (`[[status.sink]]`): JSON and RFC 5424 syslog over UDP (preferred) or
+  write-only TCP. Every message is a full snapshot of at most 1200 bytes with a sequence
+  number; optional repeat and HMAC-SHA256 signing. A dead or slow sink never delays a
+  sync. `cheval sync` reports to the same sinks
+- Read-only HTTP API (`[status.http]`): `/v1/status`, `/v1/repos`, `/v1/events`,
+  `/v1/stream`, `/healthz`, `/metrics` (Prometheus)
+- `cheval status listen`: receiver for the far side. Progress screen, the same HTTP
+  API, loss and duplicate counters, staleness detection, `--forward`, signature check.
+  New unit `cheval-status-listen.service`
+- `state/last-run.json` gains the `end` object; `cheval check` lists status settings
+- Reference: `docs/status-stream.md`
 - Logo: framed block logo in the README and in the TUI header (terminals of 34+ rows),
   four-row stencil in the TUI title bar (26+ rows), the version in the TUI footer, and
   `cheval version` (alias `about`) for the stencil and build target. ASCII-only

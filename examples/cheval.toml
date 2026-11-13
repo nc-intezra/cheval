@@ -110,3 +110,47 @@ exclude_packages = ['-dbg(sym)?$']          # skip debug packages
 check_valid_until = false                 # vendor forgets to refresh Valid-Until
 # mirror_dir = "vendor/apt"               # override the on-disk location
 # publish_partial = true                  # publish even when some packages failed
+
+# --- Daemon: scheduled runs (cheval daemon / cheval-daemon.service) ------------------------
+# Instead of a timer, `cheval daemon` stays up, runs syncs on this schedule and keeps the
+# status streams and the HTTP API alive between runs. `kill -USR1` starts a run now.
+#
+# [daemon]
+# schedule     = "03:17"          # daily, local time; several: "03:17,15:17"; interval: "6h"
+# run_on_start = false            # also run as soon as the daemon starts
+
+# --- Status reporting (monitoring only; never carries mirror content) ----------------------
+# Small status messages for other systems: progress during a run, the result, and a
+# heartbeat between runs. Made for one-way links (data diodes): nothing is ever read back,
+# every message is a full snapshot in one datagram, and a dead link never slows the mirror.
+# `cheval sync` reports to the same sinks during its run.
+#
+# [status]
+# interval_ms    = 2000           # progress cadence during a run
+# heartbeat_secs = 60             # "alive and idle" cadence between runs (daemon)
+# # host         = "mirror01"     # default: the system host name
+#
+# [[status.sink]]                 # JSON for an existing tool (SIEM, log shipper)
+# url    = "udp://diode-tx.lan:5514"
+# format = "json"
+# repeat = 2                      # send every datagram twice (UDP loss protection)
+#
+# [[status.sink]]                 # JSON for `cheval status listen` on the far side
+# url    = "udp://diode-tx.lan:5515"
+# format = "json"
+# repeat = 2
+# # hmac_key_file = "/etc/cheval/status.key"   # sign messages; give the receiver the same key
+#
+# [[status.sink]]                 # human-readable RFC 5424 syslog
+# url    = "udp://diode-tx.lan:514"
+# format = "syslog"
+# # facility = "local0"
+# # syslog_progress_secs = 30     # at most one progress line per 30 s; events always go out
+#
+# # [[status.sink]]               # secondary option: a diode TCP proxy pair (write-only)
+# # url    = "tcp://diode-tx.lan:6000"
+# # format = "json"               # newline-delimited JSON; syslog uses octet counting
+#
+# [status.http]                   # read-only HTTP API, served by `cheval daemon`
+# listen = "127.0.0.1:8611"       # /v1/status /v1/repos /v1/events /v1/stream /healthz /metrics
+# # token_file = "/etc/cheval/api.token"       # required when listen is not loopback

@@ -33,7 +33,7 @@ pub struct Listener {
     pub http_local: Option<SocketAddr>,
     input: Input,
     http: Option<(TcpListener, Option<String>)>,
-    forward: Vec<(UdpSocket, String)>,
+    forward: Vec<(UdpSocket, SocketAddr)>,
     key: Option<Vec<u8>>,
     print: bool,
 }
@@ -63,8 +63,14 @@ pub async fn bind(o: Options) -> Result<Listener> {
         if tcp {
             bail!("--forward {f}: only udp:// targets are supported");
         }
-        let sock = UdpSocket::bind("0.0.0.0:0").await?;
-        forward.push((sock, target));
+        // Resolved once, here, so a typo fails at start instead of silently dropping copies.
+        let addr = tokio::net::lookup_host(&target)
+            .await
+            .ok()
+            .and_then(|mut a| a.next())
+            .with_context(|| format!("--forward {f}: cannot resolve {target}"))?;
+        let sock = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+        forward.push((sock, addr));
     }
     let (http, http_local) = match o.http {
         Some(addr) => {
@@ -99,7 +105,8 @@ impl Printer {
         if !self.on {
             return;
         }
-        let Ok(m) = serde_json::from_str::<Message>(raw) else { return };
+        let Ok(mut m) = serde_json::from_str::<Message>(raw) else { return };
+        m.sanitize();
         // Progress and heartbeats every 30 s at most; events and results always.
         if matches!(m.body, Body::Run(_) | Body::Heartbeat(_)) {
             if self.last_status.is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
@@ -120,7 +127,7 @@ impl Listener {
         }
         // Forward exactly what arrived (signature included), and only what passed the checks.
         for (sock, target) in &self.forward {
-            let _ = sock.send_to(raw, target.as_str()).await;
+            let _ = sock.send_to(raw, target).await;
         }
         if let Ok(text) = std::str::from_utf8(raw) {
             printer.line(text.trim());
@@ -484,5 +491,159 @@ pub fn human_age(secs: u64) -> String {
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86_400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
         s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::{EndMsg, EventMsg, HeartbeatMsg, LastRun, RepoMsg, RunMsg};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn feed(store: &Store, seq: u64, body: Body) {
+        let m = Message {
+            v: 1,
+            sid: "s".into(),
+            run: "r1".into(),
+            seq,
+            ts: "2026-11-12T03:17:05Z".into(),
+            host: "mirror01".into(),
+            body,
+        };
+        assert_eq!(store.ingest(m.to_json().as_bytes(), None), Ingest::Accepted);
+    }
+
+    fn render(store: &Store, cols: u16, rows: u16) -> String {
+        let compact = logo::compact(Charset::Unicode);
+        let mut term = Terminal::new(TestBackend::new(cols, rows)).unwrap();
+        term.draw(|f| draw(f, store, "udp://0.0.0.0:5515", compact.as_deref())).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..rows)
+            .map(|y| (0..cols).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>().trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn screen_follows_the_stream() {
+        let store = Store::new(Some(Duration::from_millis(80)));
+        let empty = render(&store, 120, 24);
+        assert!(empty.contains("WAITING") && empty.contains("nothing received yet"), "{empty}");
+
+        feed(
+            &store,
+            1,
+            Body::Run(RunMsg {
+                state: "running".into(),
+                bytes_total: 1000,
+                bytes_done: 423,
+                files_total: 10,
+                files_fetched: 4,
+                speed_bps: 2048,
+                eta_s: Some(61),
+                ..Default::default()
+            }),
+        );
+        feed(
+            &store,
+            2,
+            Body::Repo(RepoMsg {
+                name: "debian".into(),
+                phase: "downloading".into(),
+                bytes_total: 1000,
+                bytes_done: 423,
+                release_age_s: Some(7500),
+                ..Default::default()
+            }),
+        );
+        feed(
+            &store,
+            5,
+            Body::Event(EventMsg {
+                level: "error".into(),
+                kind: "log".into(),
+                repo: "debian".into(),
+                text: "pool/x.deb: 404".into(),
+            }),
+        );
+        let running = render(&store, 120, 34);
+        println!("{running}\n");
+        for want in [
+            "mirror01",
+            "RUNNING",
+            "42.3%",
+            "ETA 01:01",
+            "lost 2",
+            "debian",
+            "downloading",
+            "2h 5m",
+            "[debian] pool/x.deb: 404",
+            "▀▀",
+        ] {
+            assert!(running.contains(want), "missing {want:?} in\n{running}");
+        }
+
+        feed(
+            &store,
+            6,
+            Body::End(EndMsg {
+                state: "failed".into(),
+                exit_code: 1,
+                repos_ok: 3,
+                repos_failed: 1,
+                ..Default::default()
+            }),
+        );
+        assert!(render(&store, 120, 24).contains("FINISHED WITH ERRORS"));
+        feed(
+            &store,
+            7,
+            Body::Heartbeat(HeartbeatMsg {
+                state: "idle".into(),
+                last_run: Some(LastRun {
+                    state: "failed".into(),
+                    finished_at: "2026-11-12T03:40:11Z".into(),
+                    ..Default::default()
+                }),
+                next_run: Some("2026-11-13T03:17:00+00:00".into()),
+                ..Default::default()
+            }),
+        );
+        let idle = render(&store, 120, 24);
+        assert!(
+            idle.contains("IDLE") && idle.contains("last run 2026-11-12T03:40:11Z failed") && idle.contains("next run")
+        );
+
+        // Silence is the one thing the far side must not miss.
+        std::thread::sleep(Duration::from_millis(120));
+        let stale = render(&store, 120, 24);
+        println!("{stale}");
+        assert!(stale.contains("STALE - NO SIGNAL") && !stale.contains(" IDLE "), "{stale}");
+        // A small terminal still renders.
+        assert!(render(&store, 60, 12).contains("STALE"));
+    }
+
+    #[test]
+    fn ages_read_naturally() {
+        assert_eq!(human_age(59), "0m");
+        assert_eq!(human_age(7500), "2h 5m");
+        assert_eq!(human_age(200_000), "2d 7h");
+    }
+
+    #[tokio::test]
+    async fn tcp_lines_are_bounded() {
+        let mut ok = BufReader::new(&b"one\ntwo\npartial"[..]);
+        let mut line = Vec::new();
+        assert!(read_line(&mut ok, &mut line).await.unwrap());
+        assert_eq!(line, b"one\n");
+        line.clear();
+        assert!(read_line(&mut ok, &mut line).await.unwrap());
+        line.clear();
+        assert!(!read_line(&mut ok, &mut line).await.unwrap(), "end of stream");
+        let long = vec![b'x'; MAX_LINE * 3];
+        let mut flood = BufReader::new(&long[..]);
+        line.clear();
+        assert!(read_line(&mut flood, &mut line).await.is_err());
     }
 }

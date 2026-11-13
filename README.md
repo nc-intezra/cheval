@@ -129,6 +129,8 @@ See [`examples/cheval.toml`](examples/cheval.toml) for every option.
 | `sources --base-url URL [--deb822]` | Client configuration for the mirror |
 | `snapshot create [NAME] \| list \| delete NAME` | Hard-linked point-in-time copies |
 | `bundle create OUT.tar [--full] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap |
+| `daemon [--run-on-start]` | Stay up: run syncs on `[daemon] schedule`, keep status streams and the HTTP API alive |
+| `status listen [URL] [--http ADDR] [--forward URL]… [--hmac-key-file FILE]` | Receive the status stream on the far side of a diode: progress screen and HTTP API |
 | `check`, `example` | Validate configuration, print the template |
 | `version` (alias `about`) | Logo, version and build target (`--version` stays a single machine-readable line) |
 
@@ -299,9 +301,76 @@ consistent, and they carry deletions. The baseline is `state/bundle-manifest.tsv
 one `--manifest` per destination if you feed several sites. Apply bundles in order; if
 one is lost, send a `--full` one.
 
+## Status reporting, daemon and data diodes
+
+Monitoring only: this reports on the mirror, it never moves mirror content. Files still
+cross an air gap as bundles (above), through the diode's own file transfer.
+
+```
+sending side                                  |diode|        receiving side
+
+upstream ──► cheval daemon ──► local mirror on disk
+               │
+               ├──► HTTP API (local, read-only)
+               ├──► UDP JSON   :5514 ─────────►│──► your JSON tool / SIEM
+               ├──► UDP JSON   :5515 ─────────►│──► cheval status listen ──► screen + HTTP API
+               └──► UDP syslog :514  ─────────►│──► your syslog server
+```
+
+Sending side, in `cheval.toml` (the example configuration has the full block):
+
+```toml
+[daemon]
+schedule = "03:17"                 # or "03:17,15:17", or an interval such as "6h"
+
+[[status.sink]]
+url = "udp://diode-tx.lan:5515"    # udp:// preferred; tcp:// writes NDJSON to a proxy pair
+format = "json"                    # or "syslog"
+repeat = 2
+
+[status.http]
+listen = "127.0.0.1:8611"
+```
+
+```sh
+cheval daemon                               # or: systemctl enable --now cheval-daemon
+kill -USR1 "$(pidof cheval)"                # run now (systemctl kill -s USR1 cheval-daemon)
+curl -s localhost:8611/v1/status
+```
+
+Receiving side, no configuration file needed:
+
+```sh
+cheval status listen udp://0.0.0.0:5515 --http 127.0.0.1:8611
+```
+
+On a terminal this shows a read-only progress screen; with `--no-tui` (or as
+`cheval-status-listen.service`) it prints status lines. Because nothing can be asked
+back across a diode, the receiver reports what it can know: time since the last message,
+lost and repeated messages, and **STALE** when the sender has been silent for
+`--stale-after` seconds (default 180). `--forward udp://host:port` passes accepted
+messages on to another tool; `--hmac-key-file` accepts only messages signed with the
+sink's `hmac_key_file`.
+
+What to expect:
+
+- Messages are JSON objects of type `run`, `repo`, `event`, `end` and `heartbeat`, each
+  a complete snapshot of at most 1200 bytes; syslog lines are RFC 5424. The full
+  reference is in [`docs/status-stream.md`](docs/status-stream.md).
+- A slow, dead or unresolvable sink never delays or fails a sync. Undeliverable messages
+  are dropped and counted.
+- `cheval sync` reports to the same sinks during its run. The HTTP API and heartbeats
+  belong to the daemon.
+- The daemon takes the run lock only while a run is in flight, re-reads `cheval.toml`
+  before each run, and stops cleanly on SIGTERM. Sinks, the HTTP listener and the
+  schedule are read once at start.
+- The HTTP API is read-only (`/v1/status`, `/v1/repos`, `/v1/events`, `/v1/stream`,
+  `/healthz`, `/metrics`). It listens on loopback unless you set a token.
+
 ## Scheduling
 
-[`contrib/`](contrib) has a systemd service and timer. With cron:
+Three ways, pick one: `cheval daemon` with `[daemon] schedule` (see above;
+`cheval-daemon.service`), the systemd service and timer in [`contrib/`](contrib), or cron:
 
 ```cron
 17 3 * * *  cheval -c /etc/cheval/cheval.toml sync --no-tui >/dev/null || echo "cheval failed, see /srv/cheval/log/cheval.log"
