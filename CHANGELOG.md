@@ -5,6 +5,8 @@
 - Releases now include `.deb` packages for amd64, arm64 and armhf (static binary, systemd units, example
   configuration) and a `SHA256SUMS` file; the release workflow can be re-run for
   an existing tag
+- Taking the run lock now retries for two seconds before reporting that another
+  instance is running
 
 ## v0.5.0 — 2026-11-12
 
