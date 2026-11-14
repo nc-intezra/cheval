@@ -216,13 +216,6 @@ mod tests {
     }
 
     #[test]
-    fn readme_shows_the_current_banner() {
-        let readme = include_str!("../README.md");
-        let block = banner(Charset::Unicode).join("\n");
-        assert!(readme.contains(&block), "README logo is out of date; paste `logo::banner` output");
-    }
-
-    #[test]
     fn man_page_names_the_current_version_and_every_command() {
         let man = include_str!("../man/cheval.1");
         assert!(man.contains(&format!("\"cheval {VERSION}\"")), "man/cheval.1: update the version in .TH");

@@ -4,6 +4,8 @@
 
 - README artwork: a woodcut-style horse rearing before a cheval mirror, rendered in
   Blender 5.2 from `assets/art/cheval_woodcut.py` (still and animated GIF in `assets/`)
+- The README shows the artwork instead of the text logo; the text logo stays in the
+  TUI and in `cheval version`
 
 ## v0.6.1 (not yet released)
 
