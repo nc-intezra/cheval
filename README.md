@@ -15,6 +15,11 @@
 ╚══════════════════════════════════════════════════════╝
 ```
 
+<p align="center">
+  <img src="assets/cheval-woodcut.gif" width="800"
+       alt="Woodcut-style print of a black horse rearing on its hind legs before its reflection in a cheval mirror, mane and tail blowing in the wind">
+</p>
+
 A fast, consistent, verifiable **APT repository mirror** written in Rust, with a
 terminal UI. A replacement for `apt-mirror` and Refrapt.
 
@@ -431,3 +436,18 @@ redirects, hostile paths, stale/expired upstreams, cleaning rules, filters and b
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Artwork
+
+The picture at the top was modelled and rendered in Blender 5.2 by
+[`assets/art/cheval_woodcut.py`](assets/art/cheval_woodcut.py): a metaball horse, curve
+mane and tail, and a cheval mirror, drawn with one engraving shader and inverted-hull
+outlines so the reflection is engraved too. To render it again (Blender 4.0 or newer):
+
+```sh
+blender -b --factory-startup -P assets/art/cheval_woodcut.py -- --out render
+```
+
+That writes the 1600×1000 still (`cheval.png`, also in
+[`assets/cheval-woodcut.png`](assets/cheval-woodcut.png)) and a 24-frame loop
+(`render/loop/`) that becomes the animated GIF.

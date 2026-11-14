@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- README artwork: a woodcut-style horse rearing before a cheval mirror, rendered in
+  Blender 5.2 from `assets/art/cheval_woodcut.py` (still and animated GIF in `assets/`)
+
 ## v0.6.1 (not yet released)
 
 - `cheval bundle create --only NAME` (repeatable): bundle single repositories instead of
