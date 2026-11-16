@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- `cheval ingest DROP`: the receiving end of a data diode. Watches a drop folder and
+  applies bundles once they have arrived completely (SHA-256 checksum file, or unchanged
+  for `--settle`), each read end to end first; applies them by sequence number whatever
+  order they arrive in, sets repeats aside, waits `--gap-wait` for missing ones and
+  records gaps; moves bundles to `done/` or `failed/` (with a `.reason`); verifies the
+  changed repositories; keeps `<state>/ingest/ingest.json` for monitoring. `--once` for
+  timers. New unit `cheval-ingest.service`
+- `bundle create` writes `OUT.sha256` beside each bundle (`--no-checksum-file` to skip) and
+  numbers bundles per manifest (`chain` and `sequence` in `info.json`, counter in
+  `<manifest>.seq`). Bundles from older senders are still accepted
+- `bundle create` creates the output folder if it does not exist
+- `examples/nginx-cheval.conf`: read-only nginx site with cache headers for APT
+- README: what a bundle contains, and why `bundle apply` rather than `tar -x`
+
 ## v0.6.2
 
 - Bundles keep hard links: files that are links of each other in the mirror (by-hash

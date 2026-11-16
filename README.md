@@ -122,6 +122,7 @@ See [`examples/cheval.toml`](examples/cheval.toml) for every option.
 | `sources --base-url URL [--deb822]` | Client configuration for the mirror |
 | `snapshot create [NAME] \| list \| delete NAME` | Hard-linked point-in-time copies |
 | `bundle create OUT.tar [--only NAME]… [--full] [--compress[=LEVEL]] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap, for the whole mirror or single repositories |
+| `ingest DROP [--to DIR] [--once] [--gap-wait D] [--verify off\|quick\|full]` | Receiving end of a data diode: apply bundles from a drop folder as they arrive, in order |
 | `daemon [--run-on-start]` | Stay up: run syncs on `[daemon] schedule`, keep status streams and the HTTP API alive |
 | `status listen [URL] [--http ADDR] [--forward URL]… [--hmac-key-file FILE]` | Receive the status stream on the far side of a diode: progress screen and HTTP API |
 | `check`, `example` | Validate configuration, print the template |
@@ -262,6 +263,12 @@ server {
 }
 ```
 
+A fuller site (read-only, never serves cheval's own or half-written files, cache headers
+that keep clients from holding stale `InRelease`) is in
+[`examples/nginx-cheval.conf`](examples/nginx-cheval.conf), installed as
+`/usr/share/doc/cheval/examples/nginx-cheval.conf`. Clients use the upstream host and path
+under your server, e.g. `deb http://mirror.lan/archive.ubuntu.com/ubuntu noble main`.
+
 `cheval sources --base-url http://mirror.lan` prints matching client entries. Clients
 keep verifying the **original** archive signatures: the mirror is byte-identical, so no
 re-signing and no `trusted=yes` is needed.
@@ -318,6 +325,48 @@ the smallest file). `.deb` files are already compressed, so expect a few percent
 it helps most with large index-heavy bundles. `bundle apply` detects compression by
 itself. Bundles that contain hard links or compression need cheval 0.6.2 or later to
 apply; an older cheval refuses them rather than applying them partly.
+
+**What is inside.** A bundle is an ordinary tar file (zstd-compressed with `--compress`).
+It holds the changed files at their paths below `mirror/` (`archive.ubuntu.com/ubuntu/pool/…`),
+a `.cheval-bundle/info.json` header first, and a `.cheval-bundle/delete` list last. Plain
+`tar -x` unpacks it, but skips the deletions, writes files in place while clients may be
+reading, and checks nothing; use `bundle apply` or `ingest`.
+
+### Through a data diode: `cheval ingest`
+
+`bundle create` writes `NAME.sha256` beside each bundle and numbers the bundles of each
+manifest (1, 2, 3, …). On the receiving host, `cheval ingest` watches the diode's drop
+folder and applies them:
+
+```sh
+# sending side, after each sync (e.g. ExecStartPost, or a timer after cheval.service)
+cheval bundle create /srv/diode-out/mirror-$(date +%F-%H%M).tar.zst --compress
+
+# receiving side: cheval.toml copied from the sender, base_path set for this host
+systemctl edit cheval-ingest            # your drop folder; see the unit for an example
+systemctl enable --now cheval-ingest    # or, from a timer: cheval ingest DROP --once
+```
+
+- **Complete before used.** A bundle is taken once its SHA-256 matches its `.sha256` file.
+  Without one (an older sender, or `--no-checksum-file`), once its size and time have not
+  changed for `--settle` (default 2 minutes); `--require-checksum` refuses those. Names
+  copy tools use while writing (`*.partial`, `*.part`, `*.tmp`, dot files) are ignored.
+- **Checked before written.** Every bundle is read end to end before anything is
+  written: truncation, damage, unsafe paths, links, scope. A bad one goes to `failed/`
+  with a `.reason` file and changes nothing.
+- **In order, once.** Bundles are applied by number, whatever order they arrive in. A
+  repeat is set aside. A bundle whose predecessor is missing waits `--gap-wait` (default
+  1 h), then is applied anyway; the gap is recorded and logged. Send a `--full` bundle to
+  close it: a full whole-mirror bundle replaces everything before it.
+- **Afterwards.** Applied bundles move to `done/` in the drop folder (newest 3 kept,
+  `--keep N`), the changed repositories are verified (`--verify quick` by default;
+  `full` hashes everything), and `<state>/ingest/ingest.json` records the chain position,
+  gaps, the last bundle and the last verification, for monitoring.
+- **Interruptions are safe.** A bundle that was being applied stays in the drop folder
+  and is applied again from the start; nothing is recorded until it is complete.
+- The mirror's free space is checked before each bundle; a bundle that does not fit waits.
+- Without a configuration file: `cheval ingest DROP --to /srv/mirror --state DIR` (no
+  verification). With `--to`, a configuration is read only when given with `-c`.
 
 ## Status reporting, daemon and data diodes
 

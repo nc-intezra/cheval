@@ -1557,6 +1557,7 @@ async fn bundles_keep_hard_links_and_can_be_compressed() {
         manifest: Some(base.path().join(m)),
         hard_links: links,
         compress,
+        checksum_file: true,
     };
     let (plain, zst, copies) = (base.path().join("b.tar"), base.path().join("b.tar.zst"), base.path().join("c.tar"));
     cheval::bundle::create_with(&cfg, &[], &plain, &opts("m1", true, None)).unwrap();
@@ -1622,4 +1623,183 @@ async fn bundles_keep_hard_links_and_can_be_compressed() {
     let err = cheval::bundle::apply(&newer, &fm, false).unwrap_err().to_string();
     assert!(err.contains("newer cheval"), "{err}");
     assert!(cheval::bundle::create_with(&cfg, &[], &base.path().join("x"), &opts("m4", true, Some(30))).is_err());
+}
+
+// ------------------------------------------------------------ cheval ingest (diode drop folder)
+
+#[tokio::test]
+async fn ingest_applies_bundles_in_order_once_they_have_arrived() {
+    use cheval::ingest::{Ingest, IngestOptions, VerifyAfter};
+    use std::time::Duration;
+    let (up, base, far, drop) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let root = up.path().join("repo");
+    let srv = serve(up.path().to_path_buf()).await;
+    let r = repo(&srv.url, "");
+    let cfg: Config =
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{r}", base.path().to_str().unwrap())).unwrap();
+    let far_cfg: Config =
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{r}", far.path().to_str().unwrap())).unwrap();
+    let out = |n: u32| base.path().join(format!("b{n}.tar"));
+    let opts = cheval::bundle::CreateOptions::default();
+    // Six upstream states, one bundle each (the last one full).
+    for n in 1..=6u32 {
+        let date = format!("Sun, 0{n} Aug 2026 10:00:00 UTC");
+        Fixture { date: String::leak(date), ..Default::default() }.build(
+            &root,
+            "stable",
+            &[pkg("alpha", String::leak(format!("1.{n}"))), pkg("beta", "1.0")],
+        );
+        sync_ok(base.path(), &r).await;
+        let o = cheval::bundle::CreateOptions { full: n == 6, ..opts.clone() };
+        cheval::bundle::create_with(&cfg, &[], &out(n), &o).unwrap();
+        assert!(cheval::bundle::checksum_path(&out(n)).is_file(), "bundle {n} has a .sha256 beside it");
+        let info = cheval::bundle::read_info(&out(n)).unwrap();
+        assert_eq!(info.sequence, Some(n as u64));
+        assert_eq!(info.full, n == 1 || n == 6);
+    }
+    let send = |n: u32, as_name: &str| {
+        std::fs::copy(out(n), drop.path().join(as_name)).unwrap();
+        std::fs::copy(cheval::bundle::checksum_path(&out(n)), drop.path().join(format!("{as_name}.sha256"))).unwrap();
+    };
+    let fm = far_cfg.global.mirror_path();
+    let new = |gap_wait: Duration| {
+        Ingest::new(
+            IngestOptions {
+                drop: drop.path().to_path_buf(),
+                dest: fm.clone(),
+                done: drop.path().join("done"),
+                failed: drop.path().join("failed"),
+                state: far.path().join("state/ingest"),
+                settle: Duration::ZERO,
+                require_checksum: false,
+                gap_wait,
+                keep_done: 2,
+                keep_deleted: false,
+                verify: VerifyAfter::Full,
+                once: false,
+                interval: Duration::from_secs(1),
+            },
+            Some(far_cfg.clone()),
+        )
+        .unwrap()
+    };
+    let record = || -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(far.path().join("state/ingest/ingest.json")).unwrap()).unwrap()
+    };
+    let mut ing = new(Duration::from_secs(3600));
+
+    // 3 arrives first, with a file still being written and a diode temp name: nothing happens.
+    send(3, "c.tar");
+    std::fs::write(drop.path().join("d.tar.partial"), b"half").unwrap();
+    let p = ing.pass().unwrap();
+    assert!(p.applied.is_empty() && p.failed.is_empty(), "{p:?}");
+    assert!(p.waiting.iter().any(|w| w.contains("c.tar") && w.contains("waits for 1..2")), "{p:?}");
+
+    // 1 and 2 arrive (out of name order): 1, 2, 3 are applied in sequence, then verified.
+    send(2, "a.tar");
+    send(1, "z.tar");
+    let p = ing.pass().unwrap();
+    assert_eq!(p.applied, vec!["z.tar", "a.tar", "c.tar"], "{p:?}");
+    assert_eq!(p.verify_ok, Some(true));
+    assert!(deb_path(&fm.join("t"), "alpha", "1.3").is_file());
+    assert!(!deb_path(&fm.join("t"), "alpha", "1.2").exists(), "deletions applied");
+    assert!(!drop.path().join("z.tar").exists() && !drop.path().join("z.tar.sha256").exists());
+    // Only the newest two applied bundles are kept.
+    assert!(!drop.path().join("done/z.tar").exists() && drop.path().join("done/c.tar").exists());
+    assert!(drop.path().join("d.tar.partial").exists(), "temp names are left alone");
+
+    // The diode repeats 2: set aside, not applied again.
+    send(2, "a-again.tar");
+    let p = ing.pass().unwrap();
+    assert_eq!(p.set_aside, vec!["a-again.tar"]);
+    assert!(p.applied.is_empty());
+
+    // 4 arrives damaged (cut short): it is caught by its checksum and changes nothing.
+    let bytes = std::fs::read(out(4)).unwrap();
+    std::fs::write(drop.path().join("d.tar"), &bytes[..bytes.len() / 2]).unwrap();
+    std::fs::copy(cheval::bundle::checksum_path(&out(4)), drop.path().join("d.tar.sha256")).unwrap();
+    let p = ing.pass().unwrap();
+    assert!(p.applied.is_empty() && p.failed.is_empty(), "first mismatch: maybe still arriving {p:?}");
+    let p = ing.pass().unwrap();
+    assert_eq!(p.failed, vec!["d.tar"]);
+    let reason = std::fs::read_to_string(drop.path().join("failed/d.tar.reason")).unwrap();
+    assert!(reason.contains("truncated"), "{reason}");
+    assert!(!deb_path(&fm.join("t"), "alpha", "1.4").exists());
+
+    // 5 arrives; 4 never will. It waits, and after the gap wait it is applied with the gap noted.
+    send(5, "e.tar");
+    let p = ing.pass().unwrap();
+    assert!(p.applied.is_empty() && p.waiting.iter().any(|w| w.contains("waits for 4")), "{p:?}");
+    std::mem::drop(ing);
+    let mut ing = new(Duration::ZERO);
+    let p = ing.pass().unwrap();
+    assert_eq!(p.applied, vec!["e.tar"]);
+    let rec = record();
+    let chain = rec["chains"].as_object().unwrap().values().next().unwrap().clone();
+    assert_eq!(chain["applied"], 5);
+    assert_eq!(chain["missing"], serde_json::json!([4]));
+
+    // A full bundle (6) puts everything right and clears the gap.
+    send(6, "f.tar");
+    let p = ing.pass().unwrap();
+    assert_eq!(p.applied, vec!["f.tar"]);
+    assert_eq!(p.verify_ok, Some(true));
+    let rec = record();
+    let chain = rec["chains"].as_object().unwrap().values().next().unwrap().clone();
+    assert_eq!((chain["applied"].clone(), chain["missing"].clone()), (serde_json::json!(6), serde_json::json!([])));
+    assert_eq!(rec["applied_total"], 5);
+    assert_eq!(rec["failed_total"], 1);
+
+    // A second ingest on the same state is refused while one runs.
+    assert!(
+        Ingest::new(
+            IngestOptions {
+                drop: drop.path().to_path_buf(),
+                dest: fm.clone(),
+                done: drop.path().join("done"),
+                failed: drop.path().join("failed"),
+                state: far.path().join("state/ingest"),
+                settle: Duration::ZERO,
+                require_checksum: false,
+                gap_wait: Duration::ZERO,
+                keep_done: 2,
+                keep_deleted: false,
+                verify: VerifyAfter::Off,
+                once: true,
+                interval: Duration::from_secs(1),
+            },
+            None
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn bundles_are_checked_end_to_end_before_anything_is_written() {
+    let d = tempfile::tempdir().unwrap();
+    // Not a bundle at all.
+    let junk = d.path().join("junk.tar");
+    std::fs::write(&junk, b"hello").unwrap();
+    assert!(cheval::bundle::check(&junk).is_err());
+    // A tar that ends before the closing deletion list (cut at an entry boundary).
+    let p = d.path().join("cut.tar");
+    let mut b = tar::Builder::new(std::fs::File::create(&p).unwrap());
+    let mut add = |name: &str, data: &[u8]| {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, name, data).unwrap();
+    };
+    add(".cheval-bundle/info.json", br#"{"format":1}"#);
+    add("host/pool/a.deb", b"x");
+    b.finish().unwrap();
+    drop(b);
+    let e = cheval::bundle::check(&p).unwrap_err().to_string();
+    assert!(e.contains("truncated"), "{e}");
 }

@@ -174,6 +174,11 @@ Write a multithreaded zstd stream, level 1 to 19 (default 3).
 .B bundle apply
 detects it by itself.
 .TP
+.B \-\-no\-checksum\-file
+Do not write
+.I OUT.sha256
+beside the bundle.
+.TP
 .B \-\-no\-hard\-links
 Send full copies of files that are hard links of each other in the mirror.
 By default such files (4 KiB or larger) are stored once and sent as tar link entries.
@@ -191,6 +196,73 @@ made.
 A per-repository bundle cannot write or delete outside its repository's directory,
 and a hard link in a bundle can only point inside the bundle's own scope.
 Bundles with hard links or compression need cheval 0.6.2 or later on the applying side.
+.TP
+.B ingest \fIDROP\fR [\fIOPTIONS\fR]
+Receiving end of a data diode: watch the folder
+.I DROP
+and apply bundles as they arrive.
+A bundle is taken once its SHA\-256 matches the
+.I NAME.sha256
+file
+.B bundle create
+writes beside it (or, without one, once it has not changed for
+.BR \-\-settle ).
+Every bundle is read end to end before anything is written; a damaged one goes to
+.I DROP/failed
+with a
+.I .reason
+file.
+Bundles are applied by sequence number whatever order they arrive in; a repeat is set
+aside; one whose predecessor is missing waits
+.BR \-\-gap\-wait ,
+then is applied with the gap recorded.
+A full bundle of the whole mirror replaces everything before it.
+Applied bundles move to
+.IR DROP/done ;
+the changed repositories are verified; the record is
+.IR state /ingest/ingest.json.
+Stopping mid-bundle is safe: it is applied again from the start.
+.RS
+.TP
+.BI \-\-to " DIR"
+Mirror directory (default: from the configuration).
+With
+.B \-\-to
+and no
+.BR \-\-config ,
+no configuration is read and nothing is verified.
+.TP
+.B \-\-once
+One pass, then exit (for timers); exit status 1 if a bundle failed or verification found
+problems.
+.TP
+.BI \-\-settle " D"
+How long a bundle without a checksum file must stay unchanged (default 2m).
+Durations take s, m, h or d.
+.TP
+.B \-\-require\-checksum
+Take only bundles that have a checksum file.
+.TP
+.BI \-\-gap\-wait " D"
+How long to wait for a missing earlier bundle (default 1h).
+.TP
+.BR \-\-verify " off|quick|full"
+After applying (default: quick with a configuration, off without).
+.TP
+.BI \-\-keep " N"
+Applied bundles kept in
+.I done/
+(default 3; 0 deletes them).
+.TP
+.BR \-\-state ", " \-\-done ", " \-\-failed " \fIDIR\fR"
+Where the record and lock, applied bundles and rejected bundles go.
+.TP
+.BR \-\-interval " \fID\fR"
+Time between looks at the folder (default 30s).
+.TP
+.B \-\-keep\-deleted
+Do not remove files the sending side deleted.
+.RE
 .SS Status across a one-way link
 .TP
 .B status listen \fR[\fIURL\fR] [\fIOPTIONS\fR]
@@ -398,6 +470,8 @@ cheval bundle create /media/usb/gitlab.tar \-\-only gitlab\-ee\-trixie \e
 # on the offline side:
 cheval bundle apply /media/usb/debian.tar
 cheval verify \-\-full
+# or through a data diode, applied as they arrive:
+cheval ingest /srv/diode/cheval
 .EE
 .RE
 .PP
@@ -486,6 +560,10 @@ Result of the last run, for monitoring.
 .IR base_path /state/bundle\-manifest.tsv
 What the bundle destination already has.
 .TP
+.IR base_path /state/ingest/ingest.json
+.B ingest
+record: chain position, gaps, last bundle, last verification.
+.TP
 .IR base_path /log/cheval.log
 Log of every run.
 .TP
@@ -494,7 +572,7 @@ README, example configuration, and
 .I status\-stream.md
 (status message, syslog and HTTP API reference).
 .TP
-.IR cheval.service ", " cheval.timer ", " cheval\-daemon.service ", " cheval\-status\-listen.service
+.IR cheval.service ", " cheval.timer ", " cheval\-daemon.service ", " cheval\-ingest.service ", " cheval\-status\-listen.service
 systemd units.
 Enable the timer or the daemon, not both.
 .SH NOTES

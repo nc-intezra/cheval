@@ -239,11 +239,14 @@ pub struct CreateOptions {
     pub hard_links: bool,
     /// zstd level (1-19) for a compressed bundle; `None` writes a plain tar.
     pub compress: Option<i32>,
+    /// Also write `OUT.sha256` (in `sha256sum` format) once the bundle is complete, so a
+    /// receiver such as `cheval ingest` knows the transfer finished and arrived intact.
+    pub checksum_file: bool,
 }
 
 impl Default for CreateOptions {
     fn default() -> Self {
-        CreateOptions { full: false, manifest: None, hard_links: true, compress: None }
+        CreateOptions { full: false, manifest: None, hard_links: true, compress: None, checksum_file: true }
     }
 }
 
@@ -268,10 +271,28 @@ pub fn create_with(cfg: &Config, only: &[String], out: &Path, opts: &CreateOptio
     create_scoped(&cfg.global, &resolve_scope(cfg, only)?, out, opts)
 }
 
+/// A file that hashes (SHA-256) everything written to it, so the bundle's checksum file
+/// costs no second read of a possibly very large bundle.
+struct Hashed {
+    file: std::fs::File,
+    hash: sha2::Sha256,
+}
+
+impl Write for Hashed {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.file.write(buf)?;
+        sha2::Digest::update(&mut self.hash, &buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// The bundle file being written: plain, or zstd-compressed on all cores.
 enum Sink {
-    Plain(std::io::BufWriter<std::fs::File>),
-    Zstd(zstd::stream::Encoder<'static, std::io::BufWriter<std::fs::File>>),
+    Plain(std::io::BufWriter<Hashed>),
+    Zstd(zstd::stream::Encoder<'static, std::io::BufWriter<Hashed>>),
 }
 
 impl Write for Sink {
@@ -291,7 +312,8 @@ impl Write for Sink {
 
 impl Sink {
     fn open(path: &Path, level: Option<i32>) -> Result<Sink> {
-        let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+        let file = Hashed { file: std::fs::File::create(path)?, hash: sha2::Digest::new() };
+        let file = std::io::BufWriter::with_capacity(1 << 20, file);
         Ok(match level {
             None => Sink::Plain(file),
             Some(l) => {
@@ -303,12 +325,15 @@ impl Sink {
             }
         })
     }
-    fn finish(self) -> Result<()> {
-        match self {
-            Sink::Plain(mut w) => w.flush()?,
-            Sink::Zstd(enc) => enc.finish()?.flush()?,
-        }
-        Ok(())
+    /// Flush everything, sync the file to disk and return its SHA-256 (hex).
+    fn finish(self) -> Result<String> {
+        let w = match self {
+            Sink::Plain(w) => w,
+            Sink::Zstd(enc) => enc.finish()?,
+        };
+        let h = w.into_inner().map_err(|e| e.into_error())?;
+        h.file.sync_all()?;
+        Ok(hex::encode(sha2::Digest::finalize(h.hash)))
     }
 }
 
@@ -394,6 +419,11 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
     let bytes: u64 = changed.iter().filter(|p| !link_to.contains_key(**p)).map(|p| cur[*p].0).sum();
     let saved: u64 = link_to.keys().map(|p| cur[*p].0).sum();
 
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let seq_path = sequence_path(&manifest_path);
+    let (chain, sequence) = next_sequence(&seq_path)?;
     let tmp = out.with_extension("partial");
     let mut tar = tar::Builder::new(Sink::open(&tmp, opts.compress)?);
     let mut info = serde_json::json!({
@@ -402,6 +432,8 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
         "created": chrono::Utc::now().to_rfc3339(),
         "incremental": !prev.is_empty(), "files": changed.len(), "bytes": bytes, "deletions": deleted.len(),
         "hard_links": link_to.len(),
+        // Order on the receiving side: bundles of one chain (one manifest) apply in sequence.
+        "chain": chain, "sequence": sequence, "full": prev.is_empty(), "whole": whole,
     });
     if !whole {
         // `scope` lets the receiving side refuse anything outside these directories.
@@ -419,13 +451,26 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
     }
     let del: String = deleted.iter().map(|p| format!("{p}\n")).collect();
     append_bytes(&mut tar, &format!("{META_DIR}/delete"), del.as_bytes())?;
-    tar.into_inner()?.finish()?;
+    let digest = tar.into_inner()?.finish()?;
+    // The checksum file goes first so that the bundle never exists without it: a receiver that
+    // sees `X.sha256` but no complete `X` keeps waiting. (Through a diode both may arrive in
+    // any order; the receiver handles that too.)
+    let sidecar = checksum_path(out);
+    if opts.checksum_file {
+        let name = out.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let tmp_sum = sidecar.with_extension("sha256.partial");
+        std::fs::write(&tmp_sum, format!("{digest}  {name}\n"))?;
+        std::fs::rename(&tmp_sum, &sidecar)?;
+    } else {
+        let _ = std::fs::remove_file(&sidecar); // never leave a stale one beside a new bundle
+    }
     std::fs::rename(&tmp, out)?;
     let written = std::fs::metadata(out)?.len();
     // Replace this bundle's part of the record; everything else stays as it was.
     let mut record: Manifest = recorded.into_iter().filter(|(p, _)| !covered(p)).collect();
     record.extend(cur.iter().map(|(p, v)| (p.clone(), v.clone())));
     save_manifest(&manifest_path, &record)?;
+    save_sequence(&seq_path, &chain, sequence)?;
     println!(
         "{} bundle of {what} {}: {} files ({}), {} deletions",
         if prev.is_empty() { "full" } else { "incremental" },
@@ -445,20 +490,18 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
         );
     }
     println!("manifest: {} (the next bundle is relative to it)", manifest_path.display());
+    println!(
+        "sequence {sequence} of chain {chain}{}",
+        if opts.checksum_file { format!("; checksum in {}", sidecar.display()) } else { String::new() }
+    );
     Ok(())
 }
 
 /// Apply a bundle to `dest` (a mirror directory). Entries are trusted no further than
 /// their paths can be validated: only regular files inside `dest` are ever written.
-pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
+pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyReport> {
     std::fs::create_dir_all(dest)?;
-    let mut f = std::io::BufReader::with_capacity(
-        1 << 20,
-        std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?,
-    );
-    let compressed = f.fill_buf()?.starts_with(&ZSTD_MAGIC);
-    let reader: Box<dyn Read> = if compressed { Box::new(zstd::stream::Decoder::with_buffer(f)?) } else { Box::new(f) };
-    let mut ar = tar::Archive::new(reader);
+    let (mut ar, compressed) = open_archive(bundle)?;
     let (mut files, mut bytes, mut links) = (0u64, 0u64, 0u64);
     let mut deletions: Vec<String> = Vec::new();
     let mut seen_info = false;
@@ -572,6 +615,252 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
         dest.display()
     );
     println!("run `cheval verify --full` on this side to confirm integrity");
+    Ok(ApplyReport { files, bytes, links, removed })
+}
+
+/// What [`apply`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ApplyReport {
+    pub files: u64,
+    pub bytes: u64,
+    pub links: u64,
+    pub removed: u64,
+}
+
+/// What a bundle says about itself (its `info.json`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct BundleInfo {
+    pub format: u64,
+    pub created: Option<String>,
+    /// The sender's manifest chain and this bundle's place in it (cheval 0.6.3+).
+    pub chain: Option<String>,
+    pub sequence: Option<u64>,
+    /// Ignores what the destination had: complete for its scope.
+    pub full: bool,
+    /// Covers the whole mirror (no `--only`).
+    pub whole: bool,
+    pub repos: Vec<String>,
+    pub scope: Vec<String>,
+    pub files: u64,
+    pub bytes: u64,
+    pub deletions: u64,
+    pub compressed: bool,
+}
+
+fn open_archive(bundle: &Path) -> Result<(tar::Archive<Box<dyn Read>>, bool)> {
+    let f = std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?;
+    open_reader(Box::new(f))
+}
+
+fn open_reader(raw: Box<dyn Read>) -> Result<(tar::Archive<Box<dyn Read>>, bool)> {
+    let mut f = std::io::BufReader::with_capacity(1 << 20, raw);
+    let compressed = f.fill_buf()?.starts_with(&ZSTD_MAGIC);
+    let reader: Box<dyn Read> = if compressed { Box::new(zstd::stream::Decoder::with_buffer(f)?) } else { Box::new(f) };
+    Ok((tar::Archive::new(reader), compressed))
+}
+
+fn parse_info(text: &str, compressed: bool) -> Result<BundleInfo> {
+    let v: serde_json::Value = serde_json::from_str(text).context("bundle info.json is not JSON")?;
+    let strs = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let num = |k: &str| v.get(k).and_then(|n| n.as_u64()).unwrap_or(0);
+    let scope = strs("scope");
+    Ok(BundleInfo {
+        format: v.get("format").and_then(|n| n.as_u64()).unwrap_or(1),
+        created: v.get("created").and_then(|c| c.as_str()).map(String::from),
+        chain: v.get("chain").and_then(|c| c.as_str()).map(String::from),
+        sequence: v.get("sequence").and_then(|n| n.as_u64()),
+        // Bundles before 0.6.3 say only whether they were incremental.
+        full: v
+            .get("full")
+            .and_then(|b| b.as_bool())
+            .unwrap_or_else(|| !v.get("incremental").and_then(|b| b.as_bool()).unwrap_or(true)),
+        whole: v.get("whole").and_then(|b| b.as_bool()).unwrap_or(scope.is_empty()),
+        repos: strs("repos"),
+        scope,
+        files: num("files"),
+        bytes: num("bytes"),
+        deletions: num("deletions"),
+        compressed,
+    })
+}
+
+/// Read only a bundle's header (its first entry). Cheap even for a huge bundle.
+pub fn read_info(bundle: &Path) -> Result<BundleInfo> {
+    let (mut ar, compressed) = open_archive(bundle)?;
+    let mut entries = ar.entries()?;
+    let mut first = entries.next().context("empty archive")?.context("reading the first entry")?;
+    if first.path()?.to_string_lossy() != format!("{META_DIR}/info.json") {
+        bail!("{} is not a cheval bundle", bundle.display());
+    }
+    let mut s = String::new();
+    first.read_to_string(&mut s)?;
+    parse_info(&s, compressed)
+}
+
+/// Read a whole bundle without writing anything: every entry must be readable to its end
+/// (catches truncated or damaged transfers, including zstd frame checksums), every path
+/// must be safe and inside the bundle's scope, every link must point to an earlier file of
+/// the bundle, and the closing deletion list must be present.
+pub fn check(bundle: &Path) -> Result<BundleInfo> {
+    let (ar, compressed) = open_archive(bundle)?;
+    check_archive(bundle, ar, compressed)
+}
+
+/// Reads the raw file and hashes every byte on the way.
+struct HashingReader {
+    file: std::fs::File,
+    state: std::rc::Rc<std::cell::RefCell<(sha2::Sha256, u64)>>,
+}
+
+impl Read for HashingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.file.read(buf)?;
+        let mut st = self.state.borrow_mut();
+        sha2::Digest::update(&mut st.0, &buf[..n]);
+        st.1 += n as u64;
+        Ok(n)
+    }
+}
+
+/// [`check`], and the SHA-256 of the whole file, in one read.
+pub fn check_hashed(bundle: &Path) -> Result<(BundleInfo, String)> {
+    let state = std::rc::Rc::new(std::cell::RefCell::new((<sha2::Sha256 as sha2::Digest>::new(), 0u64)));
+    let file = std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?;
+    let (mut ar, compressed) = open_reader(Box::new(HashingReader { file, state: state.clone() }))?;
+    let result = check_entries(bundle, &mut ar, compressed);
+    // Read to the end of the stream (tar end blocks, zstd epilogue) and of the file
+    // (anything past the stream), so the hash covers every byte.
+    let mut rest = ar.into_inner();
+    let _ = std::io::copy(&mut rest, &mut std::io::sink());
+    drop(rest);
+    let (mut hasher, read) =
+        std::rc::Rc::try_unwrap(state).map_err(|_| anyhow::anyhow!("reader still shared"))?.into_inner();
+    let mut f = std::fs::File::open(bundle)?;
+    std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(read))?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Ok((result?, hex::encode(sha2::Digest::finalize(hasher))))
+}
+
+fn check_archive(bundle: &Path, mut ar: tar::Archive<Box<dyn Read>>, compressed: bool) -> Result<BundleInfo> {
+    check_entries(bundle, &mut ar, compressed)
+}
+
+fn check_entries(bundle: &Path, ar: &mut tar::Archive<Box<dyn Read>>, compressed: bool) -> Result<BundleInfo> {
+    let mut info: Option<BundleInfo> = None;
+    let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut closed = false;
+    for entry in ar.entries()? {
+        let mut entry = entry.context("damaged or truncated bundle")?;
+        let path = entry.path()?.to_string_lossy().into_owned();
+        if closed {
+            bail!("entry {path:?} after the end of the bundle");
+        }
+        if let Some(meta) = path.strip_prefix(&format!("{META_DIR}/")) {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).context("damaged or truncated bundle")?;
+            match meta {
+                "info.json" if info.is_none() => {
+                    let i = parse_info(&s, compressed)?;
+                    if i.format > 2 {
+                        bail!("bundle format {} is newer than this cheval understands; upgrade cheval here", i.format);
+                    }
+                    for d in &i.scope {
+                        safe_rel_path(d).with_context(|| format!("bundle scope {d:?}"))?;
+                    }
+                    info = Some(i);
+                }
+                "delete" => {
+                    for d in s.lines() {
+                        safe_rel_path(d).with_context(|| format!("deletion {d:?}"))?;
+                    }
+                    closed = true;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let i = info.as_ref().with_context(|| format!("{} is not a cheval bundle", bundle.display()))?;
+        let rel =
+            safe_rel_path(&path).with_context(|| format!("bundle entry {path:?}"))?.to_string_lossy().into_owned();
+        let dirs: Vec<String> = i.scope.iter().map(|d| d.trim_end_matches('/').to_string()).collect();
+        if !dirs.is_empty() && !in_scope(&rel, &dirs) {
+            bail!("bundle entry {path:?} lies outside the directories the bundle covers");
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_hard_link() {
+            let link = entry.link_name()?.context("hard-link entry without a target")?.to_string_lossy().into_owned();
+            let target =
+                safe_rel_path(&link).with_context(|| format!("link target {link:?}"))?.to_string_lossy().into_owned();
+            if !placed.contains(&target) {
+                bail!("bundle link {path:?} points to {link:?}, which is not earlier in the bundle");
+            }
+        } else if kind.is_file() {
+            std::io::copy(&mut entry, &mut std::io::sink())
+                .with_context(|| format!("damaged or truncated bundle at {path}"))?;
+        } else {
+            bail!("bundle contains a non-regular entry ({path})");
+        }
+        placed.insert(rel);
+    }
+    if !closed {
+        bail!("bundle is truncated (its closing deletion list is missing)");
+    }
+    info.with_context(|| format!("{} is not a cheval bundle", bundle.display()))
+}
+
+/// `OUT.sha256` beside a bundle.
+pub fn checksum_path(bundle: &Path) -> PathBuf {
+    let mut p = bundle.as_os_str().to_owned();
+    p.push(".sha256");
+    PathBuf::from(p)
+}
+
+/// Bundle numbering lives beside its manifest: one chain per manifest (= per destination).
+fn sequence_path(manifest: &Path) -> PathBuf {
+    let mut p = manifest.as_os_str().to_owned();
+    p.push(".seq");
+    PathBuf::from(p)
+}
+
+/// The chain id and the number for the next bundle. A new chain gets a random-enough id from
+/// the clock, the process and the manifest path; it only has to differ between manifests.
+fn next_sequence(path: &Path) -> Result<(String, u64)> {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        let v: serde_json::Value =
+            serde_json::from_str(&text).with_context(|| format!("reading bundle sequence {}", path.display()))?;
+        if let (Some(c), Some(n)) =
+            (v.get("chain").and_then(|c| c.as_str()), v.get("sequence").and_then(|n| n.as_u64()))
+        {
+            return Ok((c.to_string(), n + 1));
+        }
+        bail!("{} is not a bundle sequence file", path.display());
+    }
+    let seed = format!(
+        "{}\0{}\0{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id(),
+        path.display()
+    );
+    let id = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(seed.as_bytes()));
+    Ok((id[..16].to_string(), 1))
+}
+
+fn save_sequence(path: &Path, chain: &str, sequence: u64) -> Result<()> {
+    let tmp = path.with_extension("seq.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&serde_json::json!({ "chain": chain, "sequence": sequence }))?)?;
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

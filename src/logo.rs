@@ -231,6 +231,7 @@ mod tests {
             "snapshot create",
             "bundle create",
             "bundle apply",
+            "ingest",
             "status listen",
             "version",
         ] {

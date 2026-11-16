@@ -4,7 +4,7 @@ use cheval::logo::{self, LogoMode};
 use cheval::progress::{Level, Progress, format_line};
 use cheval::status::{Hub, Reporter};
 use cheval::sync::{self, SyncOptions};
-use cheval::{bundle, daemon, headless, import, listen, probe, snapshot, status, tui, verify};
+use cheval::{bundle, daemon, headless, import, ingest, listen, probe, snapshot, status, tui, verify};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -117,6 +117,48 @@ enum Cmd {
         #[arg(long)]
         run_on_start: bool,
     },
+    /// Receiving end of a data diode: apply bundles from a drop folder as they arrive, in order
+    Ingest {
+        /// Folder the diode writes bundles into
+        drop: PathBuf,
+        /// Mirror directory to apply to [default: mirror_path from the configuration]
+        #[arg(long)]
+        to: Option<PathBuf>,
+        /// Record and lock [default: <state>/ingest from the configuration, else /var/lib/cheval/ingest]
+        #[arg(long)]
+        state: Option<PathBuf>,
+        /// Where applied bundles go [default: DROP/done]
+        #[arg(long)]
+        done: Option<PathBuf>,
+        /// Where bundles that cannot be applied go, with a .reason file [default: DROP/failed]
+        #[arg(long)]
+        failed: Option<PathBuf>,
+        /// Applied bundles kept in the done folder (0: delete once applied)
+        #[arg(long, default_value_t = 3)]
+        keep: usize,
+        /// Seconds a bundle without a .sha256 file must stay unchanged before it is taken
+        #[arg(long, value_name = "DURATION", default_value = "2m", value_parser = parse_duration)]
+        settle: std::time::Duration,
+        /// Only take bundles that have a .sha256 file
+        #[arg(long)]
+        require_checksum: bool,
+        /// How long a bundle waits for a missing earlier one before it is applied anyway
+        #[arg(long, value_name = "DURATION", default_value = "1h", value_parser = parse_duration)]
+        gap_wait: std::time::Duration,
+        /// After applying: off, quick (files present, right size) or full (hash everything)
+        /// [default: quick with a configuration, off without]
+        #[arg(long, value_enum)]
+        verify: Option<ingest::VerifyAfter>,
+        /// Do not remove files the sending side deleted
+        #[arg(long)]
+        keep_deleted: bool,
+        /// One pass over the drop folder, then exit (for timers and scripts)
+        #[arg(long)]
+        once: bool,
+        /// Seconds between looks at the drop folder
+        #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = parse_duration)]
+        interval: std::time::Duration,
+    },
     /// Receive the status stream on the far side of a data diode
     Status {
         #[command(subcommand)]
@@ -179,6 +221,10 @@ enum BundleCmd {
         /// Write hard-linked files as separate copies, for receivers older than cheval 0.6.2
         #[arg(long)]
         no_hard_links: bool,
+        /// Do not write OUT.sha256 beside the bundle (`cheval ingest` uses it to know the
+        /// bundle arrived complete)
+        #[arg(long)]
+        no_checksum_file: bool,
     },
     /// Unpack a bundle into the mirror directory of this (offline) side
     Apply {
@@ -202,6 +248,21 @@ enum SnapCmd {
     Delete {
         name: String,
     },
+}
+
+/// "90", "90s", "5m", "2h", "1d" -> a duration.
+fn parse_duration(s: &str) -> std::result::Result<std::time::Duration, String> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = num.parse().map_err(|_| format!("{s:?}: expected a number with s, m, h or d"))?;
+    let mult = match unit.trim() {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        u => return Err(format!("{s:?}: unknown unit {u:?} (use s, m, h or d)")),
+    };
+    Ok(std::time::Duration::from_secs(n * mult))
 }
 
 fn load_config(path: &Option<PathBuf>) -> Result<Config> {
@@ -241,6 +302,68 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Example => {
             print!("{}", cheval::config::EXAMPLE);
             Ok(0)
+        }
+        Cmd::Ingest {
+            drop,
+            to,
+            state,
+            done,
+            failed,
+            keep,
+            settle,
+            require_checksum,
+            gap_wait,
+            verify,
+            keep_deleted,
+            once,
+            interval,
+        } => {
+            // With --to and no --config, no configuration is read: one found by chance (in
+            // /etc/cheval, say) could describe a different mirror.
+            let cfg = if cli.config.is_some() || to.is_none() { Some(load_config(&cli.config)?) } else { None };
+            if let (Some(c), Some(t)) = (&cfg, &to)
+                && *t != c.global.mirror_path()
+                && verify != Some(ingest::VerifyAfter::Off)
+            {
+                bail!(
+                    "--to {} is not the mirror of {} ({}); verifying would check the wrong tree. \
+                     Set base_path to match, or add --verify off",
+                    t.display(),
+                    cli.config.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    c.global.mirror_path().display()
+                );
+            }
+            let dest = match (to, &cfg) {
+                (Some(d), _) => d,
+                (None, Some(c)) => c.global.mirror_path(),
+                (None, None) => unreachable!(),
+            };
+            let state = state.unwrap_or_else(|| match &cfg {
+                Some(c) => c.global.state_path().join("ingest"),
+                None => PathBuf::from("/var/lib/cheval/ingest"),
+            });
+            let verify = verify.unwrap_or(if cfg.as_ref().is_some_and(|c| !c.repos.is_empty()) {
+                ingest::VerifyAfter::Quick
+            } else {
+                ingest::VerifyAfter::Off
+            });
+            let opts = ingest::IngestOptions {
+                done: done.unwrap_or_else(|| drop.join("done")),
+                failed: failed.unwrap_or_else(|| drop.join("failed")),
+                drop,
+                dest,
+                state,
+                settle,
+                require_checksum,
+                gap_wait,
+                keep_done: keep,
+                keep_deleted,
+                verify,
+                once,
+                interval,
+            };
+            let mut ing = ingest::Ingest::new(opts, cfg)?;
+            Ok(if ing.run()? { 0 } else { 1 })
         }
         Cmd::Daemon { run_on_start } => {
             let cfg = load_config(&cli.config)?;
@@ -426,9 +549,15 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Bundle { cmd } => {
             match cmd {
-                BundleCmd::Create { out, full, manifest, only, compress, no_hard_links } => {
+                BundleCmd::Create { out, full, manifest, only, compress, no_hard_links, no_checksum_file } => {
                     let cfg = load_config(&cli.config)?;
-                    let opts = bundle::CreateOptions { full, manifest, hard_links: !no_hard_links, compress };
+                    let opts = bundle::CreateOptions {
+                        full,
+                        manifest,
+                        hard_links: !no_hard_links,
+                        compress,
+                        checksum_file: !no_checksum_file,
+                    };
                     bundle::create_with(&cfg, &only, &out, &opts)?;
                 }
                 BundleCmd::Apply { bundle: file, to, keep_deleted } => {

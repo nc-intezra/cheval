@@ -1,0 +1,43 @@
+# cheval ingest: the receiving end of a data diode. Applies bundles from the diode's drop
+# folder to the mirror as they arrive, in the order they were made, then verifies.
+#
+#   systemctl edit cheval-ingest          # set your drop folder (see below)
+#   systemctl enable --now cheval-ingest
+#   journalctl -u cheval-ingest -f        # what it does; the record is <state>/ingest/ingest.json
+#
+# Reads /etc/cheval/cheval.toml (a copy of the sending side's, with base_path set for this
+# host) for the mirror location and to verify after each bundle. The cheval user needs write
+# access to the drop folder (bundles are moved to done/ and failed/ inside it) and the mirror.
+#
+# To change options:
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/local/bin/cheval -c /etc/cheval/cheval.toml ingest /data/diode/in --gap-wait 6h
+#   ReadWritePaths=/data/diode/in
+[Unit]
+Description=cheval bundle ingest (data diode drop folder -> mirror)
+After=local-fs.target remote-fs.target
+Conflicts=cheval-daemon.service cheval.timer cheval.service
+
+[Service]
+Type=simple
+User=cheval
+ExecStart=/usr/local/bin/cheval -c /etc/cheval/cheval.toml ingest /srv/diode/cheval
+# Stopping mid-bundle is safe: the bundle stays in the drop folder and is applied again.
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=30
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/srv/cheval /srv/diode/cheval
+
+[Install]
+WantedBy=multi-user.target

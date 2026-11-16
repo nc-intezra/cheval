@@ -8,6 +8,7 @@ pub mod deb822;
 pub mod headless;
 pub mod http;
 pub mod import;
+pub mod ingest;
 pub mod listen;
 pub mod logo;
 pub mod plan;
