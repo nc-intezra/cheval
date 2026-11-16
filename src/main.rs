@@ -172,6 +172,13 @@ enum BundleCmd {
         /// Repositories that share a directory must be named together
         #[arg(long = "only", value_name = "NAME")]
         only: Vec<String>,
+        /// Compress with zstd on all cores; LEVEL 1 (fastest) to 19 (smallest). Mirrors are mostly
+        /// already-compressed packages, so expect only a few percent
+        #[arg(long, value_name = "LEVEL", num_args = 0..=1, default_missing_value = "3")]
+        compress: Option<i32>,
+        /// Write hard-linked files as separate copies, for receivers older than cheval 0.6.2
+        #[arg(long)]
+        no_hard_links: bool,
     },
     /// Unpack a bundle into the mirror directory of this (offline) side
     Apply {
@@ -419,9 +426,10 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Bundle { cmd } => {
             match cmd {
-                BundleCmd::Create { out, full, manifest, only } => {
+                BundleCmd::Create { out, full, manifest, only, compress, no_hard_links } => {
                     let cfg = load_config(&cli.config)?;
-                    bundle::create_only(&cfg, &only, &out, full, manifest)?;
+                    let opts = bundle::CreateOptions { full, manifest, hard_links: !no_hard_links, compress };
+                    bundle::create_with(&cfg, &only, &out, &opts)?;
                 }
                 BundleCmd::Apply { bundle: file, to, keep_deleted } => {
                     let dest = match to {
@@ -505,6 +513,13 @@ fn run_sync(
                 progress.error(None, format!("{e:#}"));
             }
             progress.finished.store(true, Ordering::Relaxed);
+            // Report the result as soon as the run ends, not when the TUI is closed: a
+            // receiver must not show RUNNING while the summary sits on screen.
+            if let Some((hub, reporter)) = reporting {
+                let error = r.as_ref().err().map(|e| format!("{e:#}"));
+                reporter.finish_with(r.as_ref().ok(), error).await;
+                hub.close(Duration::from_secs(2)).await;
+            }
             r
         })
     };
@@ -518,13 +533,6 @@ fn run_sync(
         rt.spawn(headless::report(progress.clone(), Duration::from_secs(10)));
     }
     let result = rt.block_on(engine)?;
-    if let Some((hub, reporter)) = reporting {
-        let error = result.as_ref().err().map(|e| format!("{e:#}"));
-        rt.block_on(async {
-            reporter.finish_with(result.as_ref().ok(), error).await;
-            hub.close(Duration::from_secs(2)).await;
-        });
-    }
     rt.shutdown_timeout(Duration::from_secs(2));
     if use_tui {
         // Leave the important lines in the terminal scrollback.

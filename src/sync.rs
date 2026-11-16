@@ -217,15 +217,26 @@ pub async fn run(
             });
         }
     }
-    let results: Vec<(usize, RepoOutcome)> = futures_util::stream::iter(work)
-        .map(|(i, repo)| {
+    // Repositories whose directories overlap (two suites of one archive, say) share files in
+    // pool/ and dists/. Running them at the same time would download the same file twice into
+    // the same place, so each such group runs one repository after another; groups still run
+    // in parallel.
+    let groups = share_groups(&work, &g);
+    let results: Vec<Vec<(usize, RepoOutcome)>> = futures_util::stream::iter(groups)
+        .map(|group| {
             let ctx = ctx.clone();
-            async move { (i, sync_repo(ctx, i, repo).await) }
+            async move {
+                let mut done = Vec::with_capacity(group.len());
+                for (i, repo) in group {
+                    done.push((i, sync_repo(ctx.clone(), i, repo).await));
+                }
+                done
+            }
         })
         .buffer_unordered(g.repo_parallel)
         .collect()
         .await;
-    for (i, o) in results {
+    for (i, o) in results.into_iter().flatten() {
         outcomes[i] = Some(o);
     }
     let mut summary = Summary {
@@ -1104,4 +1115,75 @@ async fn bare_flat(
     };
     sw.pool = parse_indices(ctx, idx, &sw.suite.clone(), vec![(IndexKind::Packages, file)], filters.clone()).await?;
     Ok(sw)
+}
+
+/// Group repositories whose mirror directories are equal or nested, keeping configuration order.
+fn share_groups(work: &[(usize, Repo)], g: &Global) -> Vec<Vec<(usize, Repo)>> {
+    let roots: Vec<PathBuf> = work.iter().map(|(_, r)| r.root(g).unwrap_or_default()).collect();
+    let overlap = |a: &PathBuf, b: &PathBuf| a.starts_with(b) || b.starts_with(a);
+    let mut group_of: Vec<usize> = (0..work.len()).collect();
+    for i in 0..work.len() {
+        for j in 0..i {
+            if overlap(&roots[i], &roots[j]) {
+                let (gi, gj) = (group_of[i], group_of[j]);
+                for k in group_of.iter_mut() {
+                    if *k == gi {
+                        *k = gj;
+                    }
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = Vec::new();
+    let mut groups: Vec<Vec<(usize, Repo)>> = Vec::new();
+    for (k, item) in work.iter().enumerate() {
+        match order.iter().position(|&gid| gid == group_of[k]) {
+            Some(pos) => groups[pos].push(item.clone()),
+            None => {
+                order.push(group_of[k]);
+                groups.push(vec![item.clone()]);
+            }
+        }
+    }
+    groups
+}
+
+#[cfg(test)]
+mod share_tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_directories_run_one_after_another() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [global]
+            base_path = "/srv/cheval"
+            [[repo]]
+            name = "debian"
+            url = "http://deb.debian.org/debian"
+            suites = ["trixie"]
+            [[repo]]
+            name = "docker"
+            url = "https://download.docker.com/linux/debian"
+            suites = ["trixie"]
+            [[repo]]
+            name = "debian-updates"
+            url = "http://deb.debian.org/debian"
+            suites = ["trixie-updates"]
+            [[repo]]
+            name = "security"
+            url = "http://deb.debian.org/debian-security"
+            suites = ["trixie-security"]
+            "#,
+        )
+        .unwrap();
+        let work: Vec<(usize, Repo)> = cfg.repos.iter().cloned().enumerate().collect();
+        let names: Vec<Vec<&str>> = share_groups(&work, &cfg.global)
+            .iter()
+            .map(|g| {
+                g.iter().map(|(_, r)| cfg.repos.iter().find(|x| x.name == r.name).unwrap().name.as_str()).collect()
+            })
+            .collect();
+        assert_eq!(names, vec![vec!["debian", "debian-updates"], vec!["docker"], vec!["security"]]);
+    }
 }

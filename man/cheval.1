@@ -1,5 +1,5 @@
 .\" cheval(1) - keep the version below in step with Cargo.toml (a test checks it).
-.TH CHEVAL 1 "2026-11-13" "cheval 0.6.1" "User Commands"
+.TH CHEVAL 1 "2026-11-16" "cheval 0.6.2" "User Commands"
 .\" File names and settings must not be hyphenated.
 .nh
 .SH NAME
@@ -155,7 +155,7 @@ Print the apt sources clients need to use this mirror, served under
 Hard-linked point-in-time copies of the mirror under
 .IR base_path /snapshots.
 .TP
-.B bundle create \fIOUT.tar\fR [\fB\-\-only\fR \fINAME\fR]... [\fB\-\-full\fR] [\fB\-\-manifest\fR \fIFILE\fR]
+.B bundle create \fIOUT.tar\fR [\fB\-\-only\fR \fINAME\fR]... [\fB\-\-full\fR] [\fB\-\-compress\fR[=\fILEVEL\fR]] [\fB\-\-no\-hard\-links\fR] [\fB\-\-manifest\fR \fIFILE\fR]
 Pack what changed since the previous bundle into a tar file to carry across an air gap.
 The first bundle is complete; later ones hold only changes and deletions.
 .RS
@@ -169,6 +169,15 @@ destination has, and each bundle updates only its own part.
 .B \-\-full
 Ignore the manifest and pack everything in reach.
 .TP
+.BR \-\-compress [=\fILEVEL\fR]
+Write a multithreaded zstd stream, level 1 to 19 (default 3).
+.B bundle apply
+detects it by itself.
+.TP
+.B \-\-no\-hard\-links
+Send full copies of files that are hard links of each other in the mirror.
+By default such files (4 KiB or larger) are stored once and sent as tar link entries.
+.TP
 .BI \-\-manifest " FILE"
 Record of what the destination has (default
 .IR state/bundle\-manifest.tsv ).
@@ -179,7 +188,9 @@ Use one per destination site.
 Unpack a bundle into the mirror directory of the offline side.
 Packages are written first and Release files last; apply bundles in the order they were
 made.
-A per-repository bundle cannot write or delete outside its repository's directory.
+A per-repository bundle cannot write or delete outside its repository's directory,
+and a hard link in a bundle can only point inside the bundle's own scope.
+Bundles with hard links or compression need cheval 0.6.2 or later on the applying side.
 .SS Status across a one-way link
 .TP
 .B status listen \fR[\fIURL\fR] [\fIOPTIONS\fR]
@@ -380,7 +391,7 @@ Carry the whole mirror, or single repositories, across an air gap:
 .PP
 .RS 4
 .EX
-cheval bundle create /media/usb/all\-2026\-11\-13.tar
+cheval bundle create /media/usb/all\-2026\-11\-13.tar.zst \-\-compress
 cheval bundle create /media/usb/debian.tar \-\-only debian
 cheval bundle create /media/usb/gitlab.tar \-\-only gitlab\-ee\-trixie \e
                                            \-\-only gitlab\-runner\-debian

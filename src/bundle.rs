@@ -35,8 +35,25 @@ fn rank(rel: &str) -> u8 {
 
 type Manifest = BTreeMap<String, (u64, String)>;
 
+/// Identity of a file on disk: (device, inode, link count). Files with the same device and
+/// inode are hard links to one another and need to travel only once.
+type Ident = (u64, u64, u64);
+
+#[cfg(unix)]
+fn ident(meta: &std::fs::Metadata) -> Option<Ident> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino(), meta.nlink()))
+}
+
+#[cfg(not(unix))]
+fn ident(_meta: &std::fs::Metadata) -> Option<Ident> {
+    None
+}
+
 /// Record every file below `dir` (which lies inside `root`) under its path relative to `root`.
-fn scan_into(m: &mut Manifest, root: &Path, dir: &Path) -> Result<()> {
+/// Metadata files are hashed on all cores; package files are tracked by size.
+fn scan_into(m: &mut Manifest, ids: &mut BTreeMap<String, Ident>, root: &Path, dir: &Path) -> Result<()> {
+    let mut to_hash: Vec<(String, PathBuf, u64)> = Vec::new();
     for e in WalkDir::new(dir).follow_links(false) {
         let e = e?;
         if !e.file_type().is_file() {
@@ -47,11 +64,66 @@ fn scan_into(m: &mut Manifest, root: &Path, dir: &Path) -> Result<()> {
             continue;
         }
         let rel = e.path().strip_prefix(root).unwrap().to_string_lossy().into_owned();
-        // Metadata is small and mutable: track it by content. Packages by size.
-        let sum = if is_meta(&rel) { hash_file(e.path(), HashAlgo::Sha256)? } else { "-".to_string() };
-        m.insert(rel, (e.metadata()?.len(), sum));
+        let meta = e.metadata()?;
+        if let Some(id) = ident(&meta) {
+            ids.insert(rel.clone(), id);
+        }
+        if is_meta(&rel) {
+            to_hash.push((rel, e.path().to_path_buf(), meta.len()));
+        } else {
+            m.insert(rel, (meta.len(), "-".to_string()));
+        }
+    }
+    // Hard links share content: hash each inode once.
+    let mut by_inode: BTreeMap<Ident, usize> = BTreeMap::new();
+    let mut unique: Vec<usize> = Vec::new();
+    let mut alias: Vec<usize> = Vec::with_capacity(to_hash.len());
+    for (i, (rel, _, _)) in to_hash.iter().enumerate() {
+        match ids.get(rel).map(|id| (id.0, id.1, 0)) {
+            Some(key) => {
+                let first = *by_inode.entry(key).or_insert_with(|| {
+                    unique.push(i);
+                    i
+                });
+                alias.push(first);
+            }
+            None => {
+                unique.push(i);
+                alias.push(i);
+            }
+        }
+    }
+    let sums = parallel_hash(&unique.iter().map(|&i| to_hash[i].1.clone()).collect::<Vec<_>>())?;
+    let sum_of: BTreeMap<usize, String> = unique.iter().copied().zip(sums).collect();
+    for (i, (rel, _, len)) in to_hash.into_iter().enumerate() {
+        m.insert(rel, (len, sum_of[&alias[i]].clone()));
     }
     Ok(())
+}
+
+/// SHA-256 of each file, spread over the available cores.
+fn parallel_hash(paths: &[PathBuf]) -> Result<Vec<String>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
+    let next = AtomicUsize::new(0);
+    let results: Vec<std::sync::Mutex<Option<Result<String>>>> =
+        paths.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|sc| {
+        for _ in 0..workers.min(paths.len().max(1)) {
+            sc.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= paths.len() {
+                        break;
+                    }
+                    let r = hash_file(&paths[i], HashAlgo::Sha256)
+                        .with_context(|| format!("hashing {}", paths[i].display()));
+                    *results[i].lock().unwrap() = Some(r);
+                }
+            });
+        }
+    });
+    results.into_iter().map(|r| r.into_inner().unwrap().expect("every path hashed")).collect()
 }
 
 /// Is `rel` the directory `scope` or something inside it?
@@ -155,9 +227,30 @@ fn append_bytes<W: Write>(tar: &mut tar::Builder<W>, name: &str, data: &[u8]) ->
     Ok(())
 }
 
+/// How `bundle create` writes its file.
+#[derive(Debug, Clone)]
+pub struct CreateOptions {
+    /// Ignore the manifest and pack everything in reach.
+    pub full: bool,
+    /// Record of what the destination has [default: <state>/bundle-manifest.tsv].
+    pub manifest: Option<PathBuf>,
+    /// Store hard-linked files once and the other names as tar hard-link entries
+    /// (needs cheval 0.6.2 or newer to apply). On by default.
+    pub hard_links: bool,
+    /// zstd level (1-19) for a compressed bundle; `None` writes a plain tar.
+    pub compress: Option<i32>,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        CreateOptions { full: false, manifest: None, hard_links: true, compress: None }
+    }
+}
+
 /// Create a bundle of everything in the mirror that changed since the manifest was last written.
 pub fn create(g: &Global, out: &Path, full: bool, manifest: Option<PathBuf>) -> Result<()> {
-    create_scoped(g, &Scope { dirs: Vec::new(), repos: Vec::new() }, out, full, manifest)
+    let opts = CreateOptions { full, manifest, ..Default::default() };
+    create_scoped(g, &Scope { dirs: Vec::new(), repos: Vec::new() }, out, &opts)
 }
 
 /// As [`create`], limited to the repositories named in `only` (all of them when empty).
@@ -166,10 +259,78 @@ pub fn create(g: &Global, out: &Path, full: bool, manifest: Option<PathBuf>) -> 
 /// some repositories reads and updates only their part of it, so per-repository and
 /// whole-mirror bundles can be mixed freely without sending anything twice or missing a change.
 pub fn create_only(cfg: &Config, only: &[String], out: &Path, full: bool, manifest: Option<PathBuf>) -> Result<()> {
-    create_scoped(&cfg.global, &resolve_scope(cfg, only)?, out, full, manifest)
+    let opts = CreateOptions { full, manifest, ..Default::default() };
+    create_scoped(&cfg.global, &resolve_scope(cfg, only)?, out, &opts)
 }
 
-fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Option<PathBuf>) -> Result<()> {
+/// [`create_only`] with every option.
+pub fn create_with(cfg: &Config, only: &[String], out: &Path, opts: &CreateOptions) -> Result<()> {
+    create_scoped(&cfg.global, &resolve_scope(cfg, only)?, out, opts)
+}
+
+/// The bundle file being written: plain, or zstd-compressed on all cores.
+enum Sink {
+    Plain(std::io::BufWriter<std::fs::File>),
+    Zstd(zstd::stream::Encoder<'static, std::io::BufWriter<std::fs::File>>),
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Sink::Plain(w) => w.write(buf),
+            Sink::Zstd(w) => w.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Sink::Plain(w) => w.flush(),
+            Sink::Zstd(w) => w.flush(),
+        }
+    }
+}
+
+impl Sink {
+    fn open(path: &Path, level: Option<i32>) -> Result<Sink> {
+        let file = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path)?);
+        Ok(match level {
+            None => Sink::Plain(file),
+            Some(l) => {
+                let mut enc = zstd::stream::Encoder::new(file, l)?;
+                let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as u32;
+                // Multithreading is optional in libzstd; a build without it still works.
+                let _ = enc.multithread(threads);
+                Sink::Zstd(enc)
+            }
+        })
+    }
+    fn finish(self) -> Result<()> {
+        match self {
+            Sink::Plain(mut w) => w.flush()?,
+            Sink::Zstd(enc) => enc.finish()?.flush()?,
+        }
+        Ok(())
+    }
+}
+
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+const MIN_LINK_SIZE: u64 = 4096;
+
+fn link_entry<W: Write>(tar: &mut tar::Builder<W>, path: &str, target: &str) -> Result<()> {
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Link);
+    h.set_size(0);
+    h.set_mode(0o644);
+    h.set_mtime(chrono::Utc::now().timestamp() as u64);
+    tar.append_link(&mut h, path, target).with_context(|| format!("adding link {path} -> {target}"))?;
+    Ok(())
+}
+
+fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) -> Result<()> {
+    if let Some(l) = opts.compress
+        && !(1..=19).contains(&l)
+    {
+        bail!("compression level {l}: use 1 (fastest) to 19 (smallest)");
+    }
     let _lock = crate::sync::lock(g)?; // a consistent view: never bundle mid-sync
     let root = g.mirror_path();
     if !root.is_dir() {
@@ -177,24 +338,25 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Op
     }
     let whole = scope.dirs.is_empty();
     let covered = |rel: &str| whole || in_scope(rel, &scope.dirs);
-    let manifest_path = manifest.unwrap_or_else(|| g.state_path().join("bundle-manifest.tsv"));
+    let manifest_path = opts.manifest.clone().unwrap_or_else(|| g.state_path().join("bundle-manifest.tsv"));
     let recorded = if manifest_path.exists() { load_manifest(&manifest_path)? } else { Manifest::new() };
     // What the destination is known to have, within this bundle's reach.
-    let prev: Manifest = if full {
+    let prev: Manifest = if opts.full {
         Manifest::new()
     } else {
         recorded.iter().filter(|(p, _)| covered(p)).map(|(p, v)| (p.clone(), v.clone())).collect()
     };
     let mut cur = Manifest::new();
+    let mut ids: BTreeMap<String, Ident> = BTreeMap::new();
     if whole {
         eprintln!("scanning {} ...", root.display());
-        scan_into(&mut cur, &root, &root)?;
+        scan_into(&mut cur, &mut ids, &root, &root)?;
     } else {
         for dir in &scope.dirs {
             let path = root.join(dir);
             if path.is_dir() {
                 eprintln!("scanning {} ...", path.display());
-                scan_into(&mut cur, &root, &path)?;
+                scan_into(&mut cur, &mut ids, &root, &path)?;
             } else if !prev.keys().any(|p| within(p, dir)) {
                 bail!("nothing has been mirrored to {} yet: run `cheval sync` first", path.display());
             }
@@ -203,17 +365,43 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Op
     let mut changed: Vec<&String> = cur.iter().filter(|(p, v)| prev.get(*p) != Some(v)).map(|(p, _)| p).collect();
     changed.sort_by_key(|p| (rank(p), p.as_str()));
     let deleted: Vec<&String> = prev.keys().filter(|p| !cur.contains_key(*p)).collect();
-    let bytes: u64 = changed.iter().map(|p| cur[*p].0).sum();
     let what = if whole { "the mirror".to_string() } else { scope.repos.join(", ") };
     if changed.is_empty() && deleted.is_empty() {
         println!("nothing changed in {what} since the last bundle; no file written");
         return Ok(());
     }
+    // Which names are hard links to a file already placed earlier in this bundle.
+    let mut first_of: BTreeMap<(u64, u64), &String> = BTreeMap::new();
+    let mut link_to: BTreeMap<&String, &String> = BTreeMap::new();
+    if opts.hard_links {
+        for rel in &changed {
+            // A link entry costs up to four tar blocks with long names: only worth it above that.
+            if let Some(&(dev, ino, nlink)) = ids.get(*rel)
+                && nlink > 1
+                && cur[*rel].0 >= MIN_LINK_SIZE
+            {
+                match first_of.get(&(dev, ino)) {
+                    Some(first) => {
+                        link_to.insert(rel, first);
+                    }
+                    None => {
+                        first_of.insert((dev, ino), rel);
+                    }
+                }
+            }
+        }
+    }
+    let bytes: u64 = changed.iter().filter(|p| !link_to.contains_key(**p)).map(|p| cur[*p].0).sum();
+    let saved: u64 = link_to.keys().map(|p| cur[*p].0).sum();
+
     let tmp = out.with_extension("partial");
-    let mut tar = tar::Builder::new(std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp)?));
+    let mut tar = tar::Builder::new(Sink::open(&tmp, opts.compress)?);
     let mut info = serde_json::json!({
-        "format": 1, "created": chrono::Utc::now().to_rfc3339(),
+        // format 2: may contain hard-link entries (cheval 0.6.2+)
+        "format": if link_to.is_empty() { 1 } else { 2 },
+        "created": chrono::Utc::now().to_rfc3339(),
         "incremental": !prev.is_empty(), "files": changed.len(), "bytes": bytes, "deletions": deleted.len(),
+        "hard_links": link_to.len(),
     });
     if !whole {
         // `scope` lets the receiving side refuse anything outside these directories.
@@ -222,13 +410,18 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Op
     }
     append_bytes(&mut tar, &format!("{META_DIR}/info.json"), &serde_json::to_vec_pretty(&info)?)?;
     for rel in &changed {
+        if let Some(target) = link_to.get(rel) {
+            link_entry(&mut tar, rel, target)?;
+            continue;
+        }
         let mut f = std::fs::File::open(root.join(rel)).with_context(|| format!("opening {rel}"))?;
         tar.append_file(rel, &mut f).with_context(|| format!("adding {rel}"))?;
     }
     let del: String = deleted.iter().map(|p| format!("{p}\n")).collect();
     append_bytes(&mut tar, &format!("{META_DIR}/delete"), del.as_bytes())?;
-    tar.into_inner()?.flush()?;
+    tar.into_inner()?.finish()?;
     std::fs::rename(&tmp, out)?;
+    let written = std::fs::metadata(out)?.len();
     // Replace this bundle's part of the record; everything else stays as it was.
     let mut record: Manifest = recorded.into_iter().filter(|(p, _)| !covered(p)).collect();
     record.extend(cur.iter().map(|(p, v)| (p.clone(), v.clone())));
@@ -241,6 +434,16 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Op
         human_bytes(bytes),
         deleted.len()
     );
+    if !link_to.is_empty() {
+        println!("  {} hard links stored as links ({} not repeated)", link_to.len(), human_bytes(saved));
+    }
+    if opts.compress.is_some() {
+        println!(
+            "  zstd: {} on disk ({:.0}% of the content)",
+            human_bytes(written),
+            written as f64 * 100.0 / bytes.max(1) as f64
+        );
+    }
     println!("manifest: {} (the next bundle is relative to it)", manifest_path.display());
     Ok(())
 }
@@ -249,9 +452,14 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, full: bool, manifest: Op
 /// their paths can be validated: only regular files inside `dest` are ever written.
 pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
     std::fs::create_dir_all(dest)?;
-    let f = std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?;
-    let mut ar = tar::Archive::new(std::io::BufReader::with_capacity(1 << 20, f));
-    let (mut files, mut bytes) = (0u64, 0u64);
+    let mut f = std::io::BufReader::with_capacity(
+        1 << 20,
+        std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?,
+    );
+    let compressed = f.fill_buf()?.starts_with(&ZSTD_MAGIC);
+    let reader: Box<dyn Read> = if compressed { Box::new(zstd::stream::Decoder::with_buffer(f)?) } else { Box::new(f) };
+    let mut ar = tar::Archive::new(reader);
+    let (mut files, mut bytes, mut links) = (0u64, 0u64, 0u64);
     let mut deletions: Vec<String> = Vec::new();
     let mut seen_info = false;
     // Set for a per-repository bundle: nothing outside these directories may be touched.
@@ -266,6 +474,13 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
                 "info.json" => {
                     seen_info = true;
                     let info: serde_json::Value = serde_json::from_str(&s).unwrap_or_default();
+                    let format = info.get("format").and_then(|v| v.as_u64()).unwrap_or(1);
+                    if format > 2 {
+                        bail!(
+                            "{} was made by a newer cheval (bundle format {format}); upgrade cheval here",
+                            bundle.display()
+                        );
+                    }
                     if let Some(list) = info.get("scope").and_then(|v| v.as_array()) {
                         let mut dirs = Vec::new();
                         for d in list {
@@ -290,7 +505,8 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
         if !seen_info {
             bail!("{} is not a cheval bundle", bundle.display());
         }
-        if !entry.header().entry_type().is_file() {
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_hard_link() {
             bail!("bundle contains a non-regular entry ({path}); refusing to apply");
         }
         let rel = safe_rel_path(&path).with_context(|| format!("bundle entry {path:?}"))?;
@@ -304,6 +520,29 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
         let mut tmp = target.as_os_str().to_owned();
         tmp.push(".cheval-new");
         let tmp = PathBuf::from(tmp);
+        if kind.is_hard_link() {
+            // Another name for a file this bundle already placed: link it (copy if the
+            // filesystem cannot link). The target is checked like any other path.
+            let link = entry.link_name()?.context("hard-link entry without a target")?.to_string_lossy().into_owned();
+            let src_rel = safe_rel_path(&link).with_context(|| format!("link target {link:?}"))?;
+            if let Some(dirs) = &scope
+                && !in_scope(&src_rel.to_string_lossy(), dirs)
+            {
+                bail!("bundle link {path:?} points outside the directories the bundle covers; refusing to apply");
+            }
+            let src = dest.join(&src_rel);
+            if !src.is_file() {
+                bail!("bundle link {path:?} points to {link:?}, which is not in the bundle or on this side");
+            }
+            let _ = std::fs::remove_file(&tmp);
+            if std::fs::hard_link(&src, &tmp).is_err() {
+                std::fs::copy(&src, &tmp).with_context(|| format!("copying {link} to {path}"))?;
+            }
+            std::fs::rename(&tmp, &target)?;
+            links += 1;
+            files += 1;
+            continue;
+        }
         let mut out = std::fs::File::create(&tmp)?;
         bytes += std::io::copy(&mut entry, &mut out).with_context(|| format!("extracting {path}"))?;
         drop(out);
@@ -325,9 +564,11 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<()> {
         }
     }
     println!(
-        "applied {}: {files} files ({}), {removed} removed, into {}",
+        "applied {}{}: {files} files ({}{}), {removed} removed, into {}",
         bundle.display(),
+        if compressed { " (zstd)" } else { "" },
         human_bytes(bytes),
+        if links > 0 { format!(", {links} of them hard links") } else { String::new() },
         dest.display()
     );
     println!("run `cheval verify --full` on this side to confirm integrity");

@@ -121,7 +121,7 @@ See [`examples/cheval.toml`](examples/cheval.toml) for every option.
 | `import FILE…` | Convert `sources.list`, deb822 `.sources`, apt-mirror `mirror.list`, Refrapt config |
 | `sources --base-url URL [--deb822]` | Client configuration for the mirror |
 | `snapshot create [NAME] \| list \| delete NAME` | Hard-linked point-in-time copies |
-| `bundle create OUT.tar [--only NAME]… [--full] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap, for the whole mirror or single repositories |
+| `bundle create OUT.tar [--only NAME]… [--full] [--compress[=LEVEL]] \| apply IN.tar [--to DIR]` | Incremental transfer across an air gap, for the whole mirror or single repositories |
 | `daemon [--run-on-start]` | Stay up: run syncs on `[daemon] schedule`, keep status streams and the HTTP API alive |
 | `status listen [URL] [--http ADDR] [--forward URL]… [--hmac-key-file FILE]` | Receive the status stream on the far side of a diode: progress screen and HTTP API |
 | `check`, `example` | Validate configuration, print the template |
@@ -289,8 +289,11 @@ cheval bundle apply /media/usb/2026-11-13.tar
 cheval verify --full
 ```
 
-Bundles are plain tar files ordered so that applying them keeps the destination
-consistent, and they carry deletions. The baseline is `state/bundle-manifest.tsv`; keep
+Bundles are tar files ordered so that applying them keeps the destination
+consistent, and they carry deletions. Files that are hard links of each other in the
+mirror (by-hash indices, snapshots) are stored once and sent as tar link entries, which
+roughly halved an Ubuntu security bundle (431 → 184 MiB). `--no-hard-links` sends full
+copies instead. The baseline is `state/bundle-manifest.tsv`; keep
 one `--manifest` per destination if you feed several sites. Apply bundles in order; if
 one is lost, send a `--full` one.
 
@@ -309,6 +312,12 @@ cheval bundle create /media/usb/gitlab.tar --only gitlab-ee-trixie --only gitlab
 - Repositories that share a mirror directory (two `[[repo]]` entries on the same
   upstream URL) share their `pool/`, so they must be named together; cheval says which.
 - `--full --only NAME` resends all of that repository and nothing else.
+
+`--compress` writes a multithreaded zstd stream (level 3 by default, `--compress=19` for
+the smallest file). `.deb` files are already compressed, so expect a few percent at most;
+it helps most with large index-heavy bundles. `bundle apply` detects compression by
+itself. Bundles that contain hard links or compression need cheval 0.6.2 or later to
+apply; an older cheval refuses them rather than applying them partly.
 
 ## Status reporting, daemon and data diodes
 

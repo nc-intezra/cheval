@@ -1,13 +1,28 @@
 # Changelog
 
-## Unreleased
+## v0.6.2 (not yet released)
 
+- Bundles keep hard links: files that are links of each other in the mirror (by-hash
+  indices, snapshots) are stored once and sent as tar link entries. An Ubuntu security
+  bundle went from 431 MiB to 184 MiB. `--no-hard-links` restores full copies. Links can
+  only point inside the bundle's scope, and only files of 4 KiB or more are linked
+- `bundle create --compress[=LEVEL]`: multithreaded zstd (level 1–19, default 3);
+  `bundle apply` detects compressed bundles by itself
+- Bundle scans hash files in parallel (up to 8 threads) and hash each inode once
+- Bundle format 2 (`info.json`); cheval refuses bundles from a newer format instead of
+  applying them partly
+- `cheval sync` with the TUI sends the final status (`end` message, syslog summary) when
+  the run finishes, not when the TUI is closed
+- Repositories whose mirror directories overlap (two suites of one upstream as separate
+  `[[repo]]` entries) now sync one after another instead of at the same time, which could
+  fetch the same file twice into one place and fail one of them. Other repositories still
+  run in parallel
 - README artwork: a woodcut-style horse rearing before a cheval mirror, rendered in
   Blender 5.2 from `assets/art/cheval_woodcut.py` (still and animated GIF in `assets/`)
 - The README shows the artwork instead of the text logo; the text logo stays in the
   TUI and in `cheval version`
 
-## v0.6.1 (not yet released)
+## v0.6.1
 
 - `cheval bundle create --only NAME` (repeatable): bundle single repositories instead of
   the whole mirror. One manifest still records what the destination has; a bundle reads

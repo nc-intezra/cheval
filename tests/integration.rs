@@ -1498,3 +1498,128 @@ async fn bundles_of_single_repositories() {
     cheval::bundle::apply(&wipe, &fm, false).unwrap();
     assert!(victim.is_file(), "a deletion outside the bundle's directories must be ignored");
 }
+
+// ---------------------------------------------------- hard links and zstd in bundles (v0.6.2)
+
+#[cfg(unix)]
+fn nlink(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(p).unwrap().nlink()
+}
+
+fn tar_kinds(path: &Path) -> (usize, usize) {
+    let f = std::fs::File::open(path).unwrap();
+    let mut r = std::io::BufReader::new(f);
+    let zst = std::io::BufRead::fill_buf(&mut r).unwrap().starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+    let rd: Box<dyn std::io::Read> = if zst { Box::new(zstd::stream::Decoder::new(r).unwrap()) } else { Box::new(r) };
+    let mut ar = tar::Archive::new(rd);
+    let (mut files, mut links) = (0, 0);
+    for e in ar.entries().unwrap() {
+        let e = e.unwrap();
+        if e.header().entry_type().is_hard_link() {
+            links += 1;
+        } else {
+            files += 1;
+        }
+    }
+    (files, links)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bundles_keep_hard_links_and_can_be_compressed() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let root = up.path().join("repo");
+    // Enough packages (each with an incompressible SHA256) that the compressed indices exceed
+    // the 4 KiB below which links are not worth it.
+    let pkgs: Vec<_> = (0..300).map(|i| pkg(String::leak(format!("package-number-{i:03}")), "1.0")).collect();
+    Fixture { by_hash: true, ..Default::default() }.build(&root, "stable", &pkgs);
+    let srv = serve(up.path().to_path_buf()).await;
+    let cfg: Config =
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{}", base.path().to_str().unwrap(), repo(&srv.url, "")))
+            .unwrap();
+    sync_ok(base.path(), &repo(&srv.url, "")).await;
+    // The mirror stores each index once and its by-hash names as hard links.
+    let mirror = base.path().join("mirror");
+    let linked: Vec<PathBuf> = walkdir::WalkDir::new(&mirror)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file() && nlink(e.path()) > 1 && e.metadata().unwrap().len() >= 4096)
+        .map(|e| e.into_path())
+        .collect();
+    assert!(!linked.is_empty(), "the fixture mirror has hard-linked by-hash files");
+
+    let far_cfg = |dir: &Path| -> Config {
+        toml::from_str(&format!("[global]\nbase_path = {:?}\n{}", dir.to_str().unwrap(), repo(&srv.url, ""))).unwrap()
+    };
+    let opts = |m: &str, links: bool, compress: Option<i32>| cheval::bundle::CreateOptions {
+        full: true,
+        manifest: Some(base.path().join(m)),
+        hard_links: links,
+        compress,
+    };
+    let (plain, zst, copies) = (base.path().join("b.tar"), base.path().join("b.tar.zst"), base.path().join("c.tar"));
+    cheval::bundle::create_with(&cfg, &[], &plain, &opts("m1", true, None)).unwrap();
+    cheval::bundle::create_with(&cfg, &[], &zst, &opts("m2", true, Some(3))).unwrap();
+    cheval::bundle::create_with(&cfg, &[], &copies, &opts("m3", false, None)).unwrap();
+
+    let (files, links) = tar_kinds(&plain);
+    assert!(links >= 1, "hard-linked names travel as link entries");
+    assert_eq!(tar_kinds(&zst), (files, links));
+    assert_eq!(tar_kinds(&copies), (files + links, 0), "--no-hard-links writes copies");
+    let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+    assert!(size(&plain) < size(&copies));
+    assert_eq!(&std::fs::read(&zst).unwrap()[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+
+    // Every variant applies to a mirror that verifies; the linked ones keep the links.
+    for (bundle, keeps_links) in [(&plain, true), (&zst, true), (&copies, false)] {
+        let far = tempfile::tempdir().unwrap();
+        cheval::bundle::apply(bundle, &far.path().join("mirror"), false).unwrap();
+        assert!(cheval::verify::run(&far_cfg(far.path()), &[], true).unwrap(), "{}", bundle.display());
+        let rel = linked[0].strip_prefix(&mirror).unwrap();
+        assert_eq!(nlink(&far.path().join("mirror").join(rel)) > 1, keeps_links, "{}", bundle.display());
+        assert_eq!(std::fs::read(far.path().join("mirror").join(rel)).unwrap(), std::fs::read(&linked[0]).unwrap());
+    }
+
+    // A link may only point at a file the bundle placed (or one already there), inside its scope.
+    let forge = |name: &str, scope: &str, link: (&str, &str)| -> PathBuf {
+        let p = base.path().join(name);
+        let mut t = tar::Builder::new(std::fs::File::create(&p).unwrap());
+        let info = format!(r#"{{"format":2{scope}}}"#);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(info.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        t.append_data(&mut h, ".cheval-bundle/info.json", info.as_bytes()).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        h.set_mode(0o644);
+        t.append_link(&mut h, link.0, link.1).unwrap();
+        t.finish().unwrap();
+        p
+    };
+    let far = tempfile::tempdir().unwrap();
+    let fm = far.path().join("mirror");
+    std::fs::create_dir_all(fm.join("b")).unwrap();
+    std::fs::write(fm.join("b/secret"), "other repository").unwrap();
+    let missing = forge("l1.tar", "", ("t/x", "t/not-there"));
+    assert!(cheval::bundle::apply(&missing, &fm, false).is_err());
+    let outside = forge("l2.tar", r#","scope":["t"],"repos":["t"]"#, ("t/x", "b/secret"));
+    assert!(cheval::bundle::apply(&outside, &fm, false).is_err());
+    assert!(!fm.join("t/x").exists());
+    let newer = base.path().join("newer.tar");
+    {
+        let mut t = tar::Builder::new(std::fs::File::create(&newer).unwrap());
+        let info = br#"{"format":3}"#;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(info.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        t.append_data(&mut h, ".cheval-bundle/info.json", &info[..]).unwrap();
+        t.finish().unwrap();
+    }
+    let err = cheval::bundle::apply(&newer, &fm, false).unwrap_err().to_string();
+    assert!(err.contains("newer cheval"), "{err}");
+    assert!(cheval::bundle::create_with(&cfg, &[], &base.path().join("x"), &opts("m4", true, Some(30))).is_err());
+}

@@ -1,6 +1,6 @@
 [package]
 name = "cheval"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.89"
 description = "Consistent, verified APT repository mirroring with a terminal UI"
@@ -35,7 +35,7 @@ tokio-util = "0.7.20"
 toml = "1.2.1"
 url = "2.5.8"
 walkdir = "2.5.0"
-zstd = "0.14.4"
+zstd = { version = "0.14.4", features = ["zstdmt"] }
 
 [dev-dependencies]
 flate2 = "1.1.11"
