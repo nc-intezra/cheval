@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.6.2 (not yet released)
+## v0.6.2
 
 - Bundles keep hard links: files that are links of each other in the mirror (by-hash
   indices, snapshots) are stored once and sent as tar link entries. An Ubuntu security

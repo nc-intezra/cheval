@@ -44,7 +44,7 @@ terminal UI. A replacement for `apt-mirror` and Refrapt.
 the [releases page](https://github.com/nc-intezra/cheval/releases) and install it:
 
 ```sh
-sudo apt install ./cheval_0.6.1_amd64.deb     # dpkg --print-architecture tells you which
+sudo apt install ./cheval_0.6.2_amd64.deb     # dpkg --print-architecture tells you which
 ```
 
 | Package | For |
@@ -68,7 +68,7 @@ against `SHA256SUMS`.
 ```sh
 cargo build --release
 install -m755 target/release/cheval /usr/local/bin/
-packaging/build-deb.sh target/release/cheval 0.6.1 . dist    # optional: your own .deb
+packaging/build-deb.sh target/release/cheval 0.6.2 . dist    # optional: your own .deb
 ```
 
 The `.deb` installs the manual page: `man cheval`. From a tarball or a source checkout,
