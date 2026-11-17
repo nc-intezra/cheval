@@ -437,7 +437,74 @@ dependencies = [
 
 [[package]]
 name = "cheval"
-version = "0.6.2"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cheval-apt",
+ "cheval-bundle",
+ "cheval-core",
+ "cheval-status",
+ "cheval-tui",
+ "chrono",
+ "clap",
+ "flate2",
+ "hex",
+ "libc",
+ "liblzma",
+ "percent-encoding",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
+name = "cheval-apt"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cheval-core",
+ "cheval-status",
+ "chrono",
+ "futures-util",
+ "regex",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "url",
+ "walkdir",
+]
+
+[[package]]
+name = "cheval-bundle"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cheval-core",
+ "chrono",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tar",
+ "tempfile",
+ "toml",
+ "walkdir",
+ "zstd",
+]
+
+[[package]]
+name = "cheval-core"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -446,26 +513,49 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
- "libc",
  "liblzma",
  "md-5 0.11.0",
  "percent-encoding",
  "pgp",
- "ratatui",
  "regex",
  "reqwest",
  "serde",
- "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
- "tar",
  "tempfile",
  "tokio",
  "tokio-util",
  "toml",
  "url",
- "walkdir",
  "zstd",
+]
+
+[[package]]
+name = "cheval-status"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "cheval-core",
+ "chrono",
+ "hex",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "cheval-tui"
+version = "0.7.0"
+dependencies = [
+ "cheval-core",
+ "ratatui",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

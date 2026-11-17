@@ -263,10 +263,12 @@ server {
 }
 ```
 
-A fuller site (read-only, never serves cheval's own or half-written files, cache headers
-that keep clients from holding stale `InRelease`) is in
-[`examples/nginx-cheval.conf`](examples/nginx-cheval.conf), installed as
-`/usr/share/doc/cheval/examples/nginx-cheval.conf`. Clients use the upstream host and path
+Fuller sites (read-only, never serve cheval's own or half-written files, cache headers
+that keep clients from holding stale `InRelease`) are in
+[`examples/apache-cheval.conf`](examples/apache-cheval.conf) (Apache 2.4; also stops
+Debian's defaults from re-encoding `.gz` files) and
+[`examples/nginx-cheval.conf`](examples/nginx-cheval.conf), installed under
+`/usr/share/doc/cheval/examples/`. Clients use the upstream host and path
 under your server, e.g. `deb http://mirror.lan/archive.ubuntu.com/ubuntu noble main`.
 
 `cheval sources --base-url http://mirror.lan` prints matching client entries. Clients
@@ -467,9 +469,24 @@ use filters for things nobody installs (debug symbols, old kernels, other flavou
 ## Development
 
 ```sh
-cargo test          # unit tests + end-to-end tests against a local fixture server
+cargo test          # every crate: unit tests + end-to-end tests against a local fixture server
 cargo clippy --all-targets
 ```
+
+The code is a Cargo workspace. Lower crates never depend on higher ones:
+
+| Crate | Holds |
+|---|---|
+| `crates/cheval-core` | configuration, HTTP client, hashing, OpenPGP, progress, run summary, run lock, schedules, logo |
+| `crates/cheval-status` | status messages, UDP/TCP/syslog sinks, the HTTP API, `status listen` |
+| `crates/cheval-apt` | the APT backend: Release and index parsing, the sync engine, verify, probe, import |
+| `crates/cheval-bundle` | bundles and snapshots (format-agnostic: they work on the mirror tree as files) |
+| `crates/cheval-tui` | the terminal UI and the plain progress output |
+| `cheval` (top level) | the binary; `daemon` and `ingest`, which tie the others together |
+
+The top-level crate re-exports every module under its old path (`cheval::sync`,
+`cheval::bundle`, …). The `cross` workflow runs the release builds (static musl for
+amd64, arm64 and armhf, plus the .deb) on every push that changes code, without publishing.
 
 The end-to-end tests cover: consistency after upstream failures, resume/retry,
 corruption (upstream and local), by-hash, sources, flat and unsigned repositories,

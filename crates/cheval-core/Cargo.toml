@@ -1,0 +1,35 @@
+[package]
+name = "cheval-core"
+description = "Configuration, HTTP, hashing, signatures and shared types for cheval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bzip2.workspace = true
+chrono.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+liblzma.workspace = true
+md-5.workspace = true
+percent-encoding.workspace = true
+pgp.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+url.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

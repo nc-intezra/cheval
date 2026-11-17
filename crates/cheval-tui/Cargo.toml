@@ -1,0 +1,18 @@
+[package]
+name = "cheval-tui"
+description = "cheval terminal UI and headless progress output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cheval-core.workspace = true
+ratatui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

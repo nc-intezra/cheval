@@ -48,7 +48,7 @@ pub fn link_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
 pub fn create(g: &Global, name: Option<String>) -> Result<String> {
     let name = name.unwrap_or_else(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
     valid_name(&name)?;
-    let _lock = crate::sync::lock(g)?; // never snapshot in the middle of a publish
+    let _lock = crate::lock::lock(g)?; // never snapshot in the middle of a publish
     let src = g.mirror_path();
     if !src.is_dir() {
         bail!("mirror directory {} does not exist yet", src.display());

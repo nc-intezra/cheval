@@ -1,0 +1,48 @@
+name: cross
+# The release build (static musl binaries for amd64, arm64 and armhf, the .deb) on every push
+# that changes Rust code, without publishing anything. A release tag should only ever be
+# pushed on a commit where this is green.
+on:
+  push:
+    paths: ["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "packaging/**", ".github/workflows/cross.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { deb_arch: amd64, target: x86_64-unknown-linux-musl,   qemu: "" }
+          - { deb_arch: arm64, target: aarch64-unknown-linux-musl,  qemu: "qemu-aarch64" }
+          - { deb_arch: armhf, target: arm-unknown-linux-musleabihf, qemu: "qemu-arm -cpu arm1176" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Smoke test the binary
+        run: |
+          bin="target/${{ matrix.target }}/release/cheval"
+          file "$bin"
+          if [ -n "${{ matrix.qemu }}" ]; then
+            sudo apt-get update && sudo apt-get install -y qemu-user
+            ${{ matrix.qemu }} "$bin" --version
+            ${{ matrix.qemu }} "$bin" example > /dev/null
+          else
+            "$bin" --version
+            "$bin" example > /dev/null
+          fi
+      - name: Build the .deb
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir dist
+          deb=$(packaging/build-deb.sh "target/${{ matrix.target }}/release/cheval" "v$v" . dist ${{ matrix.deb_arch }})
+          dpkg-deb --info "$deb"
+          if [ "${{ matrix.deb_arch }}" = amd64 ]; then
+            sudo dpkg -i "$deb" && cheval --version && man -w cheval && sudo dpkg -r cheval
+          fi

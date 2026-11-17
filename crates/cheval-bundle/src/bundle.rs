@@ -356,7 +356,7 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
     {
         bail!("compression level {l}: use 1 (fastest) to 19 (smallest)");
     }
-    let _lock = crate::sync::lock(g)?; // a consistent view: never bundle mid-sync
+    let _lock = crate::lock::lock(g)?; // a consistent view: never bundle mid-sync
     let root = g.mirror_path();
     if !root.is_dir() {
         bail!("mirror directory {} does not exist yet", root.display());

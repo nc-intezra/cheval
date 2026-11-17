@@ -603,13 +603,13 @@ impl Config {
             }
         }
         if let Some(s) = &self.daemon.schedule {
-            crate::daemon::Schedule::parse(s).context("daemon.schedule")?;
+            crate::schedule::Schedule::parse(s).context("daemon.schedule")?;
         }
         Ok(())
     }
 }
 
-pub const EXAMPLE: &str = include_str!("../examples/cheval.toml");
+pub const EXAMPLE: &str = include_str!("../../../examples/cheval.toml");
 
 #[cfg(test)]
 mod tests {

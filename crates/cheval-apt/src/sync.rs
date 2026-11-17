@@ -23,6 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+pub use crate::lock::lock;
+pub use crate::summary::{RepoOutcome, Summary};
+
 #[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
     pub dry_run: bool,
@@ -30,99 +33,6 @@ pub struct SyncOptions {
     pub only: Vec<String>,
     pub no_clean: bool,
     pub force_clean: bool,
-}
-
-#[derive(Debug, Default)]
-pub struct RepoOutcome {
-    pub name: String,
-    pub root: PathBuf,
-    pub ran: bool,
-    pub complete: bool,
-    pub cancelled: bool,
-    pub suites_ok: Vec<String>,
-    pub suites_failed: Vec<(String, String)>,
-    pub files_fetched: u64,
-    pub bytes_fetched: u64,
-    pub files_present: u64,
-    pub files_failed: u64,
-    pub pending_files: u64,
-    pub pending_bytes: u64,
-    pub expected: HashSet<PathBuf>,
-}
-
-#[derive(Debug, Default)]
-pub struct Summary {
-    pub repos: Vec<RepoOutcome>,
-    pub cleaned_files: u64,
-    pub cleaned_bytes: u64,
-    pub cancelled: bool,
-    pub dry_run: bool,
-    pub elapsed: Duration,
-}
-
-impl Summary {
-    pub fn success(&self) -> bool {
-        !self.cancelled
-            && self.repos.iter().all(|r| !r.ran || (r.complete || self.dry_run) && r.suites_failed.is_empty())
-    }
-
-    pub fn render(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!(
-            "\ncheval {} in {}\n",
-            if self.cancelled {
-                "CANCELLED"
-            } else if self.success() {
-                if self.dry_run { "dry run finished" } else { "finished successfully" }
-            } else {
-                "finished WITH ERRORS"
-            },
-            util::human_duration(self.elapsed.as_secs())
-        ));
-        for r in &self.repos {
-            if !r.ran {
-                s.push_str(&format!("  {:<24} skipped\n", r.name));
-                continue;
-            }
-            let state = if r.cancelled {
-                "cancelled"
-            } else if r.suites_failed.is_empty() {
-                "ok"
-            } else if r.suites_ok.is_empty() {
-                "FAILED"
-            } else {
-                "PARTIAL"
-            };
-            s.push_str(&format!(
-                "  {:<24} {:<9} fetched {} files ({}), {} already present, {} failed\n",
-                r.name,
-                state,
-                r.files_fetched,
-                human_bytes(r.bytes_fetched),
-                r.files_present,
-                r.files_failed
-            ));
-            if self.dry_run {
-                s.push_str(&format!(
-                    "  {:<24} would download {} files ({})\n",
-                    "",
-                    r.pending_files,
-                    human_bytes(r.pending_bytes)
-                ));
-            }
-            for (suite, why) in &r.suites_failed {
-                s.push_str(&format!("      suite {suite}: {why}\n"));
-            }
-        }
-        if self.cleaned_files > 0 {
-            s.push_str(&format!(
-                "  cleaned {} obsolete files ({})\n",
-                self.cleaned_files,
-                human_bytes(self.cleaned_bytes)
-            ));
-        }
-        s
-    }
 }
 
 struct Ctx {
@@ -156,25 +66,6 @@ enum IndexState {
     Staged,
     Absent(String),
     Failed(String),
-}
-
-/// Take the exclusive run lock so two instances never write the same tree.
-pub fn lock(g: &Global) -> Result<std::fs::File> {
-    let dir = g.state_path();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let path = dir.join("cheval.lock");
-    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
-    // Retry briefly: a lock released a moment ago can still be held for an instant by
-    // a process that was forked while the previous holder had the file open.
-    for attempt in 0..40 {
-        if f.try_lock().is_ok() {
-            return Ok(f);
-        }
-        if attempt < 39 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-    bail!("another cheval instance is running (lock {})", path.display())
 }
 
 pub async fn run(

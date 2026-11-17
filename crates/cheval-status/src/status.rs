@@ -9,7 +9,7 @@
 //! * emitting never blocks the mirror: sinks are fed from bounded queues and drop when full.
 use crate::config::{Sink, SinkFormat, Status};
 use crate::progress::{Level, Phase, Progress};
-use crate::sync::Summary;
+use crate::summary::Summary;
 use crate::util::{human_bytes, human_duration};
 use anyhow::{Context, Result};
 use chrono::{SecondsFormat, Utc};
@@ -1079,7 +1079,7 @@ impl EndMsg {
         let t = p.totals();
         let ran: Vec<_> = s.repos.iter().filter(|r| r.ran).collect();
         let bad =
-            |r: &&crate::sync::RepoOutcome| !r.suites_failed.is_empty() || !(r.complete || s.dry_run) || r.cancelled;
+            |r: &&crate::summary::RepoOutcome| !r.suites_failed.is_empty() || !(r.complete || s.dry_run) || r.cancelled;
         let failed: Vec<String> = ran.iter().filter(|r| bad(r)).map(|r| r.name.clone()).collect();
         let (state, exit_code) = if s.cancelled {
             ("cancelled", 130)

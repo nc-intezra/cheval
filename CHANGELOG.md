@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## v0.7.0
+
+Two parts: `cheval ingest` and its bundle additions (built after 0.6.2, first released
+here; second list below), and a restructuring of the code that changes no behavior. The
+restructuring was checked by running the build before it (`db99df6`) and 0.7.0 on the same
+repository: mirror, snapshot and ingested trees byte for byte; bundle entries and header;
+logs; status stream; every HTTP API endpoint; every command's `--help`.
+
+- The code is now a Cargo workspace: `cheval-core`, `cheval-status`, `cheval-apt`,
+  `cheval-bundle`, `cheval-tui`, and the `cheval` binary (see README, Development). This
+  prepares a second repository format (RPM) as its own backend crate
+- The run summary, run lock and daemon schedule moved into `cheval-core` (unchanged, still
+  reachable under their old paths)
+- New `cross` workflow: the static release builds and .deb on every push, without
+  publishing, so a tag is only pushed on a commit known to build for all three targets
+- `examples/apache-cheval.conf`: Apache 2.4 site for serving the mirror, shipped in the .deb
+  beside the nginx example
+
+### Also new in 0.7.0 since 0.6.2
 
 - `cheval ingest DROP`: the receiving end of a data diode. Watches a drop folder and
   applies bundles once they have arrived completely (SHA-256 checksum file, or unchanged

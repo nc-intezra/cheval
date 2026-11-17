@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn man_page_names_the_current_version_and_every_command() {
-        let man = include_str!("../man/cheval.1");
+        let man = include_str!("../../../man/cheval.1");
         assert!(man.contains(&format!("\"cheval {VERSION}\"")), "man/cheval.1: update the version in .TH");
         for cmd in [
             "sync",
