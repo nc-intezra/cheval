@@ -8,6 +8,10 @@
 A fast, consistent, verifiable **APT repository mirror** written in Rust, with a
 terminal UI. A replacement for `apt-mirror` and Refrapt.
 
+**Documentation:** this README, the manual page (`man cheval`), and the
+[wiki](https://github.com/nc-intezra/cheval/wiki) (configuration, everyday use, pitfalls
+and the roadmap, including planned RPM support).
+
 ```
 ┌ cheval · /srv/cheval → /srv/cheval/mirror  RUNNING  elapsed 00:14 ─────────────────────────────┐
 │██████████████████████ 72.6%  346.0 MiB / 476.7 MiB                        ▂▄▆▆▇▆▆▇▆▅▆▆▇▆▆▆▇▆│
@@ -455,6 +459,9 @@ edited, so clients still *see* filtered packages and get a 404 when installing o
 use filters for things nobody installs (debug symbols, old kernels, other flavours).
 
 ## Limits and caveats
+
+The [wiki](https://github.com/nc-intezra/cheval/wiki) keeps a fuller list of pitfalls and
+the plans for what comes next.
 
 * HTTP and HTTPS upstreams only (no rsync/ftp); APT repositories only (no RPM).
 * Signature checks are cryptographic against the keys in `keyring`; key expiry and
