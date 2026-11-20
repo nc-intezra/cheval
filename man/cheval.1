@@ -189,8 +189,14 @@ Record of what the destination has (default
 Use one per destination site.
 .RE
 .TP
-.B bundle apply \fIIN.tar\fR [\fB\-\-to\fR \fIDIR\fR] [\fB\-\-keep\-deleted\fR]
+.B bundle apply \fIIN.tar\fR [\fB\-\-to\fR \fIDIR\fR] [\fB\-\-keep\-deleted\fR] [\fB\-\-no\-progress\fR]
 Unpack a bundle into the mirror directory of the offline side.
+Progress goes to stderr: on a terminal, a bar with the share of the bundle read, files done,
+speed and time left; otherwise (a log, a pipe) one line every 30 seconds.
+.B \-\-no\-progress
+turns it off.
+.B ingest
+shows the same progress while it checks and applies a bundle.
 Packages are written first and Release files last; apply bundles in the order they were
 made.
 A per-repository bundle cannot write or delete outside its repository's directory,

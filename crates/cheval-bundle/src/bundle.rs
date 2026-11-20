@@ -2,6 +2,7 @@
 //! an air gap, and apply it on the other side in an order that keeps the destination
 //! consistent (packages first, indices next, Release files last, deletions at the end).
 use crate::config::{Config, Global};
+use crate::meter::{Counters, Counting, Meter, Progress};
 use crate::util::{HashAlgo, hash_file, human_bytes, safe_rel_path};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -500,8 +501,18 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
 /// Apply a bundle to `dest` (a mirror directory). Entries are trusted no further than
 /// their paths can be validated: only regular files inside `dest` are ever written.
 pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyReport> {
+    apply_with(bundle, dest, keep_deleted, Progress::Auto)
+}
+
+/// [`apply`], choosing whether progress is shown (see [`crate::meter`]).
+pub fn apply_with(bundle: &Path, dest: &Path, keep_deleted: bool, progress: Progress) -> Result<ApplyReport> {
     std::fs::create_dir_all(dest)?;
-    let (mut ar, compressed) = open_archive(bundle)?;
+    let counters = std::sync::Arc::new(Counters::default());
+    let file = std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let (mut ar, compressed) = open_reader(Box::new(Counting { inner: file, count: counters.read.clone() }))?;
+    // Started once the header is read, so its "bundle covers …" line comes first.
+    let mut meter: Option<Meter> = None;
     let (mut files, mut bytes, mut links) = (0u64, 0u64, 0u64);
     let mut deletions: Vec<String> = Vec::new();
     let mut seen_info = false;
@@ -539,6 +550,9 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyRepo
                         println!("bundle covers {} ({})", repos.join(", "), dirs.join(", "));
                         scope = Some(dirs);
                     }
+                    let m = Meter::start("apply", total, counters.clone(), progress);
+                    m.set_total_files(info.get("files").and_then(|v| v.as_u64()).unwrap_or(0));
+                    meter = Some(m);
                 }
                 "delete" => deletions = s.lines().map(str::to_string).collect(),
                 _ => {}
@@ -584,6 +598,7 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyRepo
             std::fs::rename(&tmp, &target)?;
             links += 1;
             files += 1;
+            meter.as_ref().inspect(|m| m.file_done());
             continue;
         }
         let mut out = std::fs::File::create(&tmp)?;
@@ -591,12 +606,17 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyRepo
         drop(out);
         std::fs::rename(&tmp, &target)?;
         files += 1;
+        meter.as_ref().inspect(|m| m.file_done());
     }
     if !seen_info {
         bail!("{} is not a cheval bundle", bundle.display());
     }
     let mut removed = 0;
     if !keep_deleted {
+        if deletions.len() > 1000 {
+            meter.take(); // clears the bar
+            println!("removing {} files the sending side deleted ...", deletions.len());
+        }
         for d in &deletions {
             if let Ok(rel) = safe_rel_path(d)
                 && scope.as_ref().is_none_or(|dirs| in_scope(&rel.to_string_lossy(), dirs))
@@ -606,6 +626,7 @@ pub fn apply(bundle: &Path, dest: &Path, keep_deleted: bool) -> Result<ApplyRepo
             }
         }
     }
+    drop(meter); // clears the bar before the summary
     println!(
         "applied {}{}: {files} files ({}{}), {removed} removed, into {}",
         bundle.display(),
@@ -729,9 +750,18 @@ impl Read for HashingReader {
 
 /// [`check`], and the SHA-256 of the whole file, in one read.
 pub fn check_hashed(bundle: &Path) -> Result<(BundleInfo, String)> {
+    check_hashed_with(bundle, Progress::Auto)
+}
+
+/// [`check_hashed`], choosing whether progress is shown.
+pub fn check_hashed_with(bundle: &Path, progress: Progress) -> Result<(BundleInfo, String)> {
     let state = std::rc::Rc::new(std::cell::RefCell::new((<sha2::Sha256 as sha2::Digest>::new(), 0u64)));
     let file = std::fs::File::open(bundle).with_context(|| format!("opening {}", bundle.display()))?;
-    let (mut ar, compressed) = open_reader(Box::new(HashingReader { file, state: state.clone() }))?;
+    let total = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let counters = std::sync::Arc::new(Counters::default());
+    let reader = Counting { inner: HashingReader { file, state: state.clone() }, count: counters.read.clone() };
+    let (mut ar, compressed) = open_reader(Box::new(reader))?;
+    let meter = Meter::start("check", total, counters, progress);
     let result = check_entries(bundle, &mut ar, compressed);
     // Read to the end of the stream (tar end blocks, zstd epilogue) and of the file
     // (anything past the stream), so the hash covers every byte.
@@ -750,6 +780,7 @@ pub fn check_hashed(bundle: &Path) -> Result<(BundleInfo, String)> {
         }
         sha2::Digest::update(&mut hasher, &buf[..n]);
     }
+    drop(meter);
     Ok((result?, hex::encode(sha2::Digest::finalize(hasher))))
 }
 

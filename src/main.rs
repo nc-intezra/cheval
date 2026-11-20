@@ -235,6 +235,9 @@ enum BundleCmd {
         /// Do not remove files that were deleted on the sending side
         #[arg(long)]
         keep_deleted: bool,
+        /// No progress bar (on a terminal) or progress lines (in a log) on stderr
+        #[arg(long)]
+        no_progress: bool,
     },
 }
 
@@ -560,16 +563,20 @@ fn real_main(cli: Cli) -> Result<i32> {
                     };
                     bundle::create_with(&cfg, &only, &out, &opts)?;
                 }
-                BundleCmd::Apply { bundle: file, to, keep_deleted } => {
-                    let dest = match to {
-                        Some(d) => d,
+                BundleCmd::Apply { bundle: file, to, keep_deleted, no_progress } => {
+                    // The run lock is held for the whole apply (it used to be released before
+                    // the apply started, so a sync could run at the same time).
+                    let (dest, _lock) = match to {
+                        Some(d) => (d, None),
                         None => {
                             let cfg = load_config(&cli.config)?;
-                            let _lock = sync::lock(&cfg.global)?;
-                            cfg.global.mirror_path()
+                            let lock = sync::lock(&cfg.global)?;
+                            (cfg.global.mirror_path(), Some(lock))
                         }
                     };
-                    bundle::apply(&file, &dest, keep_deleted)?;
+                    let progress =
+                        if no_progress { cheval::meter::Progress::Off } else { cheval::meter::Progress::Auto };
+                    bundle::apply_with(&file, &dest, keep_deleted, progress)?;
                 }
             }
             Ok(0)

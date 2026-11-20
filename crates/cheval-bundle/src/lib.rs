@@ -2,7 +2,8 @@
 //! agnostic: works on the mirror tree as files.
 
 // Re-exported so modules keep addressing them as `crate::…`.
-pub use cheval_core::{config, lock, util};
+pub use cheval_core::{config, lock, logo, util};
 
 pub mod bundle;
+pub mod meter;
 pub mod snapshot;

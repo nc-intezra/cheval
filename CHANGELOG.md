@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- `bundle apply` shows progress: on a terminal, a bar with the share of the bundle read,
+  files done, speed and time left; in a log or pipe, one line every 30 seconds (so short
+  applies log nothing extra). On stderr; stdout is unchanged. `--no-progress` turns it off.
+  `ingest` shows the same while it checks and applies a bundle
+- Fix: `bundle apply` without `--to` released the mirror lock before applying, so a sync
+  could run at the same time; the lock is now held until the apply finishes
+
 ## v0.7.0
 
 Two parts: `cheval ingest` and its bundle additions (built after 0.6.2, first released
