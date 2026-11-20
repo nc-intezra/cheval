@@ -437,12 +437,13 @@ dependencies = [
 
 [[package]]
 name = "cheval"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-apt",
  "cheval-bundle",
  "cheval-core",
+ "cheval-registry",
  "cheval-status",
  "cheval-tui",
  "chrono",
@@ -462,12 +463,13 @@ dependencies = [
  "tokio-util",
  "toml",
  "walkdir",
+ "zip",
  "zstd",
 ]
 
 [[package]]
 name = "cheval-apt"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -488,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-bundle"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -506,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-core"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -535,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-registry"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -558,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-rpm"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -578,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-status"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -595,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-tui"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "cheval-core",
  "ratatui",

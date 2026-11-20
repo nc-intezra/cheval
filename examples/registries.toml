@@ -1,0 +1,65 @@
+# Package registries (cheval 0.9.0, experimental): crates.io, Go modules, Maven Central.
+#
+# Each entry mirrors a chosen set of packages and everything they depend on, under the
+# upstream host names (mirror/<host>/...), so that clients keep their stock settings when
+# internal DNS (for example a response policy zone) points those names at the mirror
+# server. See apache-registries.conf for the matching Apache virtual hosts.
+#
+# What to mirror is given as `packages` (followed through their dependencies) and/or
+# `lockfiles` (exact versions, no closure): Cargo.lock, go.sum, `mvn dependency:list`.
+# Mirrors are additive: versions stay until you delete their files.
+
+[global]
+base_path = "/srv/cheval"
+
+# ---------------------------------------------------------------- Rust crates
+# index.crates.io (sparse index) + static.crates.io (crate files). Index files are
+# rewritten to list only the versions in the mirror, so cargo never picks a missing one.
+[[repo]]
+name     = "crates-io"
+format   = "crates"
+url      = "https://index.crates.io/"
+# downloads = "https://static.crates.io/crates/"   # default; must match config.json's dl
+packages = [
+    "serde", "serde_json", "anyhow", "clap@4",
+    "tokio@1.40",           # newest 1.x that is >= 1.40
+    "reqwest@=0.12.9",      # exactly this version
+]
+lockfiles = [
+    # "/srv/cheval/locks/project-a/Cargo.lock",
+]
+# dev_dependencies = true  # also the dev-dependencies of the crates in `packages`
+
+# ---------------------------------------------------------------- Go modules
+# proxy.golang.org: .info/.mod/.zip per version, @v/list per module. go.sum input checks
+# every zip and go.mod against its h1: hash. The checksum database (sum.golang.org) is not
+# mirrored: clients need a complete go.sum, or GOSUMDB=off / GONOSUMDB=<patterns>.
+[[repo]]
+name      = "go-proxy"
+format    = "go"
+url       = "https://proxy.golang.org/"
+packages  = [
+    "golang.org/x/net@latest",
+    "github.com/spf13/cobra@v1.8.1",
+]
+lockfiles = [
+    # "/srv/cheval/locks/service-b/go.sum",
+]
+
+# ---------------------------------------------------------------- Maven Central
+# repo.maven.apache.org/maven2: POMs, artifacts and their .sha1 files (checked), parent
+# POMs, imported BOMs, maven-metadata.xml for the mirrored versions.
+# For complete builds also list the plugins: `mvn dependency:resolve-plugins` output works
+# as a lock file too.
+[[repo]]
+name     = "maven-central"
+format   = "maven"
+url      = "https://repo.maven.apache.org/maven2/"
+packages = [
+    "org.slf4j:slf4j-api:2.0.13",
+    "com.google.guava:guava:latest",
+    "io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.111.Final",
+]
+lockfiles = [
+    # "/srv/cheval/locks/app/dependency-list.txt",   # mvn dependency:list -DoutputFile=...
+]

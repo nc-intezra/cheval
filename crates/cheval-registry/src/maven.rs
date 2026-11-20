@@ -53,7 +53,8 @@ pub struct Pom {
 /// Read the parts of a POM that dependency resolution needs (profiles are not applied).
 pub fn parse_pom(xml: &[u8]) -> Result<Pom> {
     let mut r = quick_xml::Reader::from_reader(xml);
-    let mut pom = Pom { gradle: String::from_utf8_lossy(xml).contains("published-with-gradle-metadata"), ..Default::default() };
+    let mut pom =
+        Pom { gradle: String::from_utf8_lossy(xml).contains("published-with-gradle-metadata"), ..Default::default() };
     let mut path: Vec<String> = Vec::new();
     let mut text = String::new();
     let mut dep = PomDep::default();
@@ -159,7 +160,12 @@ fn interpolate(s: &str, props: &BTreeMap<String, String>) -> String {
 }
 
 fn dep_key(d: &PomDep) -> (String, String, String, String) {
-    (d.group.clone(), d.artifact.clone(), d.typ.clone().unwrap_or_else(|| "jar".into()), d.classifier.clone().unwrap_or_default())
+    (
+        d.group.clone(),
+        d.artifact.clone(),
+        d.typ.clone().unwrap_or_else(|| "jar".into()),
+        d.classifier.clone().unwrap_or_default(),
+    )
 }
 
 fn interp_dep(d: &PomDep, props: &BTreeMap<String, String>) -> PomDep {
@@ -186,7 +192,9 @@ pub fn file_rel(gav: &Gav, classifier: Option<&str>, ext: &str) -> String {
 /// The file extension (and implied classifier) of a dependency type or packaging.
 pub fn type_ext(typ: &str) -> (&str, Option<&str>) {
     match typ {
-        "jar" | "bundle" | "maven-plugin" | "ejb" | "orbit" | "eclipse-plugin" | "hk2-jar" | "takari-jar" => ("jar", None),
+        "jar" | "bundle" | "maven-plugin" | "ejb" | "orbit" | "eclipse-plugin" | "hk2-jar" | "takari-jar" => {
+            ("jar", None)
+        }
         "test-jar" => ("jar", Some("tests")),
         "ejb-client" => ("jar", Some("client")),
         "java-source" => ("jar", Some("sources")),
@@ -242,8 +250,20 @@ pub fn ver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
                 _ => p.1.cmp(&q.1).then_with(|| p.2.cmp(&q.2)),
             },
             // 1.0 < 1.0.1, but 1.0-rc1 < 1.0.
-            (Some(p), None) => if p.0 == 2 || p.1 >= 5 { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
-            (None, Some(q)) => if q.0 == 2 || q.1 >= 5 { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
+            (Some(p), None) => {
+                if p.0 == 2 || p.1 >= 5 {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            }
+            (None, Some(q)) => {
+                if q.0 == 2 || q.1 >= 5 {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                }
+            }
             (None, None) => std::cmp::Ordering::Equal,
         };
         if o.is_ne() {
@@ -340,6 +360,10 @@ pub fn read_dependency_list(text: &str) -> Vec<Coord> {
     }
     out
 }
+
+/// A coordinate to resolve, the exclusions inherited on the way to it, and whether to
+/// follow its dependencies.
+type Queued = (Coord, Vec<(String, String)>, bool);
 
 type Fut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -488,8 +512,7 @@ fn excluded(ex: &[(String, String)], g: &str, a: &str) -> bool {
 pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
     let repo = ctx.repo;
     let store = Store::default();
-    // (coordinate, exclusions inherited, follow dependencies)
-    let mut queue: Vec<(Coord, Vec<(String, String)>, bool)> = Vec::new();
+    let mut queue: Vec<Queued> = Vec::new();
     for s in &repo.packages {
         let mut c = parse_coord(s)?;
         if c.gav.2.eq_ignore_ascii_case("latest") {
@@ -518,7 +541,11 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
         let batch: Vec<_> = std::mem::take(&mut queue)
             .into_iter()
             .filter(|(c, _, _)| {
-                seen.insert((c.gav.clone(), c.typ.clone().unwrap_or_default(), c.classifier.clone().unwrap_or_default()))
+                seen.insert((
+                    c.gav.clone(),
+                    c.typ.clone().unwrap_or_default(),
+                    c.classifier.clone().unwrap_or_default(),
+                ))
             })
             .collect();
         let store = &store;
@@ -555,7 +582,10 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
                     continue;
                 }
                 let Some(v) = d.version.clone() else {
-                    ctx.warn(format!("{}:{}:{}: dependency {}:{} has no version", c.gav.0, c.gav.1, c.gav.2, d.group, d.artifact));
+                    ctx.warn(format!(
+                        "{}:{}:{}: dependency {}:{} has no version",
+                        c.gav.0, c.gav.1, c.gav.2, d.group, d.artifact
+                    ));
                     continue;
                 };
                 if v.contains("${") || v.starts_with('[') || v.starts_with('(') {
@@ -568,7 +598,11 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
                 let mut ex2 = ex.clone();
                 ex2.extend(d.exclusions.iter().cloned());
                 queue.push((
-                    Coord { gav: (d.group.clone(), d.artifact.clone(), v), typ: d.typ.clone().or(Some("jar".into())), classifier: d.classifier.clone() },
+                    Coord {
+                        gav: (d.group.clone(), d.artifact.clone(), v),
+                        typ: d.typ.clone().or(Some("jar".into())),
+                        classifier: d.classifier.clone(),
+                    },
                     ex2,
                     true,
                 ));
@@ -666,7 +700,11 @@ fn xml_escape(s: &str) -> String {
 pub fn metadata_xml(g: &str, a: &str, versions: &[String]) -> String {
     let release = versions.iter().rev().find(|v| !v.ends_with("-SNAPSHOT"));
     let mut s = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n");
-    s += &format!("  <groupId>{}</groupId>\n  <artifactId>{}</artifactId>\n  <versioning>\n", xml_escape(g), xml_escape(a));
+    s += &format!(
+        "  <groupId>{}</groupId>\n  <artifactId>{}</artifactId>\n  <versioning>\n",
+        xml_escape(g),
+        xml_escape(a)
+    );
     if let Some(l) = versions.last() {
         s += &format!("    <latest>{}</latest>\n", xml_escape(l));
     }
@@ -711,7 +749,10 @@ mod tests {
         let c = parse_coord("g:a:jar:sources:1").unwrap();
         assert_eq!((c.typ.as_deref(), c.classifier.as_deref()), (Some("jar"), Some("sources")));
         assert!(parse_coord("g:a").is_err());
-        assert_eq!(file_rel(&("org.slf4j".into(), "slf4j-api".into(), "2.0.13".into()), None, "jar"), "org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar");
+        assert_eq!(
+            file_rel(&("org.slf4j".into(), "slf4j-api".into(), "2.0.13".into()), None, "jar"),
+            "org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar"
+        );
         assert_eq!(file_rel(&("g".into(), "a".into(), "1".into()), Some("tests"), "jar"), "g/a/1/a-1-tests.jar");
     }
 

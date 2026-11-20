@@ -157,7 +157,8 @@ pub fn requires(gomod: &str) -> Vec<(String, String)> {
         } else {
             continue;
         };
-        let f: Vec<String> = body.split_whitespace().map(|s| s.trim_matches('"').trim_matches('`').to_string()).collect();
+        let f: Vec<String> =
+            body.split_whitespace().map(|s| s.trim_matches('"').trim_matches('`').to_string()).collect();
         if f.len() >= 2 && f[1].starts_with('v') {
             out.push((f[0].clone(), f[1].clone()));
         }
@@ -255,7 +256,8 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
         if ctx.cancelled() {
             bail!("cancelled");
         }
-        let batch: Vec<(String, String)> = std::mem::take(&mut frontier).into_iter().filter(|k| seen.insert(k.clone())).collect();
+        let batch: Vec<(String, String)> =
+            std::mem::take(&mut frontier).into_iter().filter(|k| seen.insert(k.clone())).collect();
         let got = par(batch, ctx.parallel(), |(m, v)| {
             let base = base.clone();
             async move {
@@ -363,7 +365,6 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
         let staged = ctx.stage_bytes("list", text.as_bytes())?;
         plan.publish(staged, ctx.local(&list_url)?);
     }
-    let _ = &mut root_set;
     plan.summary = format!("{} modules, {n_versions} module versions ({n_zips} with source zips)", listed.len());
     Ok(plan)
 }

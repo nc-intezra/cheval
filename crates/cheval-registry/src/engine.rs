@@ -15,7 +15,6 @@ use crate::summary::RepoOutcome;
 use crate::util::{Checksum, file_matches, human_bytes, link_or_copy_atomic};
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,7 +37,10 @@ pub enum PostCheck {
     None,
     /// A Go module zip: every file under `prefix` (`module@version/`), and when known the
     /// `h1:` hash from `go.sum`.
-    GoZip { prefix: String, h1: Option<String> },
+    GoZip {
+        prefix: String,
+        h1: Option<String>,
+    },
 }
 
 /// A file to download into the mirror.
@@ -134,7 +136,8 @@ impl<'a> Ctx<'a> {
     pub async fn fetch(&self, url: &Url) -> Result<Option<(PathBuf, Vec<u8>)>> {
         let name = url.path().rsplit('/').next().unwrap_or("file").to_string();
         let dest = self.stage_path(&name);
-        let job = Job { rh: &self.rh, url: url.clone(), alt_url: None, dest: &dest, size: None, sum: None, label: name };
+        let job =
+            Job { rh: &self.rh, url: url.clone(), alt_url: None, dest: &dest, size: None, sum: None, label: name };
         match self.env.net.fetch(job).await {
             Ok(_) => {
                 let data = tokio::fs::read(&dest).await?;
@@ -216,7 +219,8 @@ pub async fn sync_entry(env: &Env<'_>, idx: usize, repo: &Repo, staging: &Path, 
                     file_matches(&w.dest, w.size, sum)
                 }
                 PostCheck::GoZip { prefix, h1 } => {
-                    w.dest.is_file() && (recheck != Recheck::Hash || crate::go::check_zip(&w.dest, prefix, h1.as_deref()).is_ok())
+                    w.dest.is_file()
+                        && (recheck != Recheck::Hash || crate::go::check_zip(&w.dest, prefix, h1.as_deref()).is_ok())
                 }
             };
             if ok {
@@ -382,9 +386,4 @@ where
     Fut: std::future::Future<Output = R>,
 {
     futures_util::stream::iter(items.into_iter().map(f)).buffer_unordered(n).collect().await
-}
-
-/// Keep a set of seen keys; true the first time.
-pub fn first<K: std::hash::Hash + Eq>(seen: &mut HashSet<K>, k: K) -> bool {
-    seen.insert(k)
 }

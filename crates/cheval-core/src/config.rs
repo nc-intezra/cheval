@@ -771,7 +771,11 @@ impl Config {
                         bail!("repo {}: `{k}` does not apply to format = \"{}\"", r.name, r.format);
                     }
                     if r.packages.is_empty() && r.lockfiles.is_empty() {
-                        bail!("repo {}: format = \"{}\" needs `packages` or `lockfiles` (what to mirror)", r.name, r.format);
+                        bail!(
+                            "repo {}: format = \"{}\" needs `packages` or `lockfiles` (what to mirror)",
+                            r.name,
+                            r.format
+                        );
                     }
                     for l in &r.lockfiles {
                         if !l.is_file() {
@@ -831,7 +835,10 @@ impl Config {
                         bail!("repo {}: `checksums`, `signature` and `include` are for format = \"files\"", r.name);
                     }
                     if !r.packages.is_empty() || !r.lockfiles.is_empty() || r.downloads.is_some() {
-                        bail!("repo {}: `packages`, `lockfiles` and `downloads` are for crates, go and maven entries", r.name);
+                        bail!(
+                            "repo {}: `packages`, `lockfiles` and `downloads` are for crates, go and maven entries",
+                            r.name
+                        );
                     }
                     if r.format == Format::Files && r.metalink.is_some() {
                         bail!("repo {}: `metalink` is for format = \"rpm\"", r.name);
@@ -1057,6 +1064,35 @@ mod tests {
             let e = parse(&format!("[[repo]]\nname = \"x\"\n{body}")).unwrap_err().to_string();
             assert!(e.contains(want), "{body}: {e}");
         }
+    }
+
+    /// examples/registries.toml is valid and lays out as documented.
+    #[test]
+    fn registry_example_configuration() {
+        let text =
+            include_str!("../../../examples/registries.toml").replace("[global]\nbase_path = \"/srv/cheval\"\n", "");
+        let cfg = parse(&text).unwrap();
+        let g = &cfg.global;
+        let dirs: Vec<Vec<String>> = cfg
+            .repos
+            .iter()
+            .map(|r| {
+                r.dirs(g)
+                    .unwrap()
+                    .iter()
+                    .map(|d| d.strip_prefix(g.mirror_path()).unwrap().display().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                vec!["index.crates.io".to_string(), "static.crates.io/crates".to_string()],
+                vec!["proxy.golang.org".to_string()],
+                vec!["repo.maven.apache.org/maven2".to_string()],
+            ]
+        );
+        assert!(cfg.repos.iter().all(|r| r.format.is_registry()));
     }
 
     /// examples/rpm-targets.toml is valid and expands as documented.

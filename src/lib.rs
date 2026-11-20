@@ -6,6 +6,7 @@
 pub use cheval_apt::{clean, deb822, import, plan, probe, release, sync, verify};
 pub use cheval_bundle::{bundle, snapshot};
 pub use cheval_core::{config, http, lock, logo, meter, progress, schedule, sig, summary, util};
+pub use cheval_registry::{cargo, go, maven};
 pub use cheval_status::{api, listen, sink, status};
 pub use cheval_tui::{headless, tui};
 

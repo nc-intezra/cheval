@@ -148,7 +148,14 @@ pub async fn run(
                 let dirs = cfg.repos[i].dirs(&g).unwrap_or_else(|_| vec![o.root.clone()]);
                 let (name, complete, mode) = (o.name.clone(), o.ran && o.complete, cfg.repos[i].clean(&g));
                 dirs.into_iter()
-                    .map(|root| CleanInput { idx: i, name: name.clone(), root, expected: expected.clone(), complete, mode })
+                    .map(|root| CleanInput {
+                        idx: i,
+                        name: name.clone(),
+                        root,
+                        expected: expected.clone(),
+                        complete,
+                        mode,
+                    })
                     .collect::<Vec<_>>()
             })
             .collect();
@@ -1036,9 +1043,8 @@ async fn bare_flat(
 /// Group repositories whose mirror directories are equal or nested, keeping configuration order.
 fn share_groups(work: &[(usize, Repo)], g: &Global) -> Vec<Vec<(usize, Repo)>> {
     let roots: Vec<Vec<PathBuf>> = work.iter().map(|(_, r)| r.dirs(g).unwrap_or_default()).collect();
-    let overlap = |a: &Vec<PathBuf>, b: &Vec<PathBuf>| {
-        a.iter().any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)))
-    };
+    let overlap =
+        |a: &Vec<PathBuf>, b: &Vec<PathBuf>| a.iter().any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)));
     let mut group_of: Vec<usize> = (0..work.len()).collect();
     for i in 0..work.len() {
         for j in 0..i {

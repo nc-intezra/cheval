@@ -38,12 +38,13 @@ pub fn verify_entry(g: &Global, repo: &Repo, full: bool, progress: Progress) -> 
     }
     let mut checks = Vec::new();
     match repo.format {
-        Format::Crates => crates(g, repo, &root, &mut c, &mut checks)?,
+        Format::Crates => crates(g, &root, &mut c, &mut checks)?,
         Format::Go => go(repo, &root, &mut c, &mut checks)?,
         Format::Maven => maven(&root, &mut c, &mut checks),
         _ => {}
     }
-    let total_bytes = full.then(|| checks.iter().filter_map(|k| std::fs::metadata(&k.path).ok()).map(|m| m.len()).sum());
+    let total_bytes =
+        full.then(|| checks.iter().filter_map(|k| std::fs::metadata(&k.path).ok()).map(|m| m.len()).sum());
     let meter = Meter::start("verify", total_bytes, Arc::new(Counters::default()), progress);
     meter.set_total_files(checks.len() as u64);
     for k in checks {
@@ -77,7 +78,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
     crate::engine::walk_files(dir)
 }
 
-fn crates(g: &Global, repo: &Repo, root: &Path, c: &mut Counts, checks: &mut Vec<Check>) -> Result<()> {
+fn crates(g: &Global, root: &Path, c: &mut Counts, checks: &mut Vec<Check>) -> Result<()> {
     let cfg = std::fs::read(root.join("config.json")).context("not mirrored yet (no config.json)")?;
     let cfg: serde_json::Value = serde_json::from_slice(&cfg).context("config.json")?;
     let dl = cfg.get("dl").and_then(|v| v.as_str()).context("config.json has no dl")?.to_string();
@@ -95,7 +96,6 @@ fn crates(g: &Global, repo: &Repo, root: &Path, c: &mut Counts, checks: &mut Vec
         for (_, l) in lines {
             let url = crate::cargo::download_url(&dl, &l.name, &l.vers, &l.cksum)?;
             let path = crate::config::url_dir(g, url.as_str())?;
-            let _ = repo;
             checks.push(Check { path, how: How::Digest(HashAlgo::Sha256, l.cksum) });
         }
     }
@@ -115,7 +115,11 @@ fn go(repo: &Repo, root: &Path, c: &mut Counts, checks: &mut Vec<Check>) -> Resu
         if !dir.ends_with("@v") {
             continue;
         }
-        let Some(module) = dir.parent().and_then(|m| m.strip_prefix(root).ok()).and_then(|m| crate::go::unescape(&m.to_string_lossy())) else {
+        let Some(module) = dir
+            .parent()
+            .and_then(|m| m.strip_prefix(root).ok())
+            .and_then(|m| crate::go::unescape(&m.to_string_lossy()))
+        else {
             continue;
         };
         if name == "list" {
@@ -148,7 +152,12 @@ fn maven(root: &Path, c: &mut Counts, checks: &mut Vec<Check>) {
     for f in files_under(root) {
         let s = f.to_string_lossy().into_owned();
         if let Some(main) = s.strip_suffix(".sha1") {
-            let hex = std::fs::read_to_string(&f).unwrap_or_default().split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            let hex = std::fs::read_to_string(&f)
+                .unwrap_or_default()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
             let main = PathBuf::from(main);
             if hex.len() == 40 {
                 checks.push(Check { path: main, how: How::Digest(HashAlgo::Sha1, hex) });

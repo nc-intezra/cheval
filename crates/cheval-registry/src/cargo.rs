@@ -177,7 +177,8 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
     let mut files: HashMap<String, Option<Vec<(String, IndexLine)>>> = HashMap::new();
     let mut selected: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     // (crate, requirement, is root, allow yanked)
-    let mut queue: Vec<(String, VersionReq, bool, bool)> = roots.iter().map(|(n, r, e)| (n.clone(), r.clone(), true, *e)).collect();
+    let mut queue: Vec<(String, VersionReq, bool, bool)> =
+        roots.iter().map(|(n, r, e)| (n.clone(), r.clone(), true, *e)).collect();
     let mut want_names: Vec<String> = pinned.iter().map(|p| p.0.clone()).collect();
     want_names.extend(queue.iter().map(|q| q.0.clone()));
     let mut done_reqs: BTreeSet<(String, String)> = BTreeSet::new();
@@ -251,7 +252,10 @@ pub async fn plan(ctx: &Ctx<'_>) -> Result<Plan> {
                     continue;
                 }
                 let Ok(r) = VersionReq::parse(&d.req) else {
-                    ctx.warn(format!("crate {} {}: dependency {} has an unreadable requirement {:?}", line.name, line.vers, d.name, d.req));
+                    ctx.warn(format!(
+                        "crate {} {}: dependency {} has an unreadable requirement {:?}",
+                        line.name, line.vers, d.name, d.req
+                    ));
                     continue;
                 };
                 want_names.push(d.crate_name().to_string());

@@ -8,7 +8,9 @@
 A fast, consistent, verifiable **APT repository mirror** written in Rust, with a
 terminal UI. A replacement for `apt-mirror` and Refrapt. Since 0.8.0 it also mirrors
 **RPM (yum/dnf) repositories and installer ISOs**, experimentally (see
-[RPM repositories and ISOs](#rpm-repositories-and-isos-experimental)).
+[RPM repositories and ISOs](#rpm-repositories-and-isos-experimental)), and since 0.9.0
+selected packages from **crates.io, Go module proxies and Maven Central** (see
+[Package registries](#package-registries-cratesio-go-maven-experimental)).
 
 **Documentation:** this README, the manual page (`man cheval`), and the
 [wiki](https://github.com/nc-intezra/cheval/wiki) (configuration, everyday use, pitfalls
@@ -50,7 +52,7 @@ and the roadmap).
 the [releases page](https://github.com/nc-intezra/cheval/releases) and install it:
 
 ```sh
-sudo apt install ./cheval_0.8.0_amd64.deb     # dpkg --print-architecture tells you which
+sudo apt install ./cheval_0.9.0_amd64.deb     # dpkg --print-architecture tells you which
 ```
 
 | Package | For |
@@ -74,7 +76,7 @@ against `SHA256SUMS`.
 ```sh
 cargo build --release
 install -m755 target/release/cheval /usr/local/bin/
-packaging/build-deb.sh target/release/cheval 0.8.0 . dist    # optional: your own .deb
+packaging/build-deb.sh target/release/cheval 0.9.0 . dist    # optional: your own .deb
 ```
 
 The `.deb` installs the manual page: `man cheval`. From a tarball or a source checkout,
@@ -318,6 +320,72 @@ keyring   = "/etc/cheval/keys/rocky"
 Not yet: per-package RPM signature checks (clients check them on install), RHEL
 (entitlement certificates), and `.rpm` packages of cheval itself.
 
+## Package registries: crates.io, Go, Maven (experimental)
+
+Registries are far too large to mirror whole (crates.io is about 400 GB, Maven Central
+several TB), so these entries mirror **a chosen set of packages and everything they
+depend on**. `packages` names what you want and is followed through its dependencies;
+`lockfiles` give exact versions (`Cargo.lock`, `go.sum`, `mvn dependency:list` output)
+and need no closure. [`examples/registries.toml`](examples/registries.toml) has one
+entry of each.
+
+```toml
+[[repo]]
+name      = "crates-io"
+format    = "crates"
+url       = "https://index.crates.io/"          # sparse index; crate files: static.crates.io
+packages  = ["serde", "tokio@1.40", "reqwest@=0.12.9"]
+lockfiles = ["/srv/cheval/locks/app/Cargo.lock"]
+
+[[repo]]
+name      = "go-proxy"
+format    = "go"
+url       = "https://proxy.golang.org/"
+packages  = ["golang.org/x/net@latest", "github.com/spf13/cobra@v1.8.1"]
+lockfiles = ["/srv/cheval/locks/svc/go.sum"]
+
+[[repo]]
+name      = "maven-central"
+format    = "maven"
+url       = "https://repo.maven.apache.org/maven2/"
+packages  = ["org.slf4j:slf4j-api:2.0.13", "com.google.guava:guava:latest"]
+lockfiles = ["/srv/cheval/locks/app/dependency-list.txt"]
+```
+
+- **Same host names, stock clients.** Files land under `mirror/<host>/` exactly as the
+  upstream serves them. On a network whose DNS points `index.crates.io`,
+  `static.crates.io`, `proxy.golang.org` and `repo.maven.apache.org` at the mirror server
+  (a response policy zone, for example), cargo, go and mvn work unchanged: give each name
+  an HTTPS virtual host with a certificate the clients trust.
+  [`examples/apache-registries.conf`](examples/apache-registries.conf) has the four
+  Apache virtual hosts. Without such DNS, `cheval sources` prints client settings
+  (cargo source replacement, `GOPROXY`, a Maven `<mirror>`).
+- **crates.** The newest non-yanked version matching each requirement, then its normal,
+  build, optional and target-specific dependencies (cargo's resolver reads them all; for
+  every platform). Crate files are checked against the index's SHA-256. Index files are
+  rewritten to list **only mirrored versions**, so resolution never picks a version the
+  mirror does not have; `config.json` is copied as it is and published last.
+- **Go.** `go.sum` lines are checked against their `h1:` hashes (the zip and the
+  `go.mod`). `packages` (`module@version`, `@latest`) follow `require` lines through every
+  reachable `go.mod` and take the zip of the version minimal version selection picks;
+  `@v/list` lists the mirrored release versions. The checksum database (`sum.golang.org`)
+  is not mirrored: clients need a complete `go.sum`, or `GOSUMDB=off` (or `GONOSUMDB`).
+- **Maven.** The POM, the artifact and their `.sha1` (checked), parent POMs and imported
+  BOMs, compile and runtime dependencies with exclusions, optional flags and dependency
+  management applied; `maven-metadata.xml` lists the mirrored versions. Build plugins
+  are artifacts too: add the output of `mvn dependency:resolve-plugins` to `lockfiles`.
+- **Additive and consistent.** A version, once mirrored, stays (and stays listed) until
+  its files are deleted, so older lock files keep working. Listings (index files,
+  `@v/list`, `maven-metadata.xml`) are published after every file they name is in place;
+  if a download fails they are not replaced.
+- **Everywhere else.** The run, the TUI, status streams, `verify` (`--full` hashes every
+  crate, zip and jar), `check`, bundles (`--only` carries both crates.io host
+  directories), snapshots and `ingest` handle these entries like any other.
+
+Not yet: Rust toolchains (`static.rust-lang.org`), the Go checksum database, Maven
+version ranges and profiles (a dependency only reachable through them is reported, not
+followed), and Gradle-only metadata beyond `.module` files.
+
 ## Serving the mirror
 
 Any static web server works; point it at `mirror_path` (or at a snapshot):
@@ -526,8 +594,8 @@ use filters for things nobody installs (debug symbols, old kernels, other flavou
 The [wiki](https://github.com/nc-intezra/cheval/wiki) keeps a fuller list of pitfalls and
 the plans for what comes next.
 
-* HTTP and HTTPS upstreams only (no rsync/ftp). RPM and ISO support is experimental in
-  0.8.0 (see [RPM repositories and ISOs](#rpm-repositories-and-isos-experimental)).
+* HTTP and HTTPS upstreams only (no rsync/ftp). RPM and ISO support (since
+  0.8.0) and the package registries (since 0.9.0) are experimental.
 * Signature checks are cryptographic against the keys in `keyring`; key expiry and
   revocation are not evaluated — keep keyrings current.
 * A package replaced upstream under the same file name is swapped atomically, but
@@ -552,6 +620,7 @@ The code is a Cargo workspace. Lower crates never depend on higher ones:
 | `crates/cheval-status` | status messages, UDP/TCP/syslog sinks, the HTTP API, `status listen` |
 | `crates/cheval-apt` | the APT backend: Release and index parsing, the sync engine, verify, probe, import |
 | `crates/cheval-rpm` | the RPM and files backends: repomd/primary/metalink parsing, checksum lists, sync, verify |
+| `crates/cheval-registry` | the crates, go and maven backends: sparse index, GOPROXY and Maven 2 layouts, POM models, sync, verify |
 | `crates/cheval-bundle` | bundles and snapshots (format-agnostic: they work on the mirror tree as files) |
 | `crates/cheval-tui` | the terminal UI and the plain progress output |
 | `cheval` (top level) | the binary; `daemon` and `ingest`, which tie the others together |
@@ -563,7 +632,9 @@ amd64, arm64 and armhf, plus the .deb) on every push that changes code, without 
 The end-to-end tests cover: consistency after upstream failures, resume/retry,
 corruption (upstream and local), by-hash, sources, flat and unsigned repositories,
 signature enforcement (needs `gpg` to create test keys), credential handling across
-redirects, hostile paths, stale/expired upstreams, cleaning rules, filters and bundles.
+redirects, hostile paths, stale/expired upstreams, cleaning rules, filters and bundles,
+RPM and ISO trees, and the three registries (closures, filtered listings, checksum and
+`h1:` enforcement, lock files).
 
 ## License
 
