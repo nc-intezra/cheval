@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.8.0
+
+RPM repositories and installer ISOs, experimental. APT behaviour is unchanged.
+
+- `format = "rpm"`: yum/dnf repositories mirrored verbatim. Every metadata file
+  `repomd.xml` lists is fetched and checked, packages are checked against `primary.xml`,
+  source packages are skipped, and `repomd.xml` is published last. A repository with a
+  missing package keeps its previous state; the previous metadata generation stays one
+  run for clients mid-update
+- Trust: `repomd.xml.asc` with `keyring`, or a Fedora `metalink` checksum (EPEL), or HTTPS
+  with a warning; `verify = "require"` needs a keyring or metalink
+- `format = "files"`: folders listed in a checksum file (GNU or BSD style; detached or
+  clear-signed signature, the signed copy wins), `include` patterns, identical files
+  stored once, replaced when upstream changes them. For installer ISOs
+- `{release}`, `{repo}`, `{arch}` placeholders with `releases`, `repos`, `arches`: one
+  entry covers several repositories; each is published, or fails, on its own
+- `verify`, `check`, `sources` (yum `.repo` stanzas), `probe` and `ingest` handle the new
+  formats
+- Downloads pinned by a checksum may exceed the 4 GiB limit for files of unknown size
+- `examples/rpm-targets.toml`: Rocky 9, CentOS Stream 8/9, CentOS 6/7 vaults, EPEL 6-9
+  and their DVD ISOs
+- New crate `cheval-rpm`; parsers tested against output of the real `createrepo_c`
+- The `cross` workflow keeps its binaries and .debs as artifacts for 14 days
+
 ## v0.7.1
 
 - Progress on stderr for the long operations outside `sync` (stdout is unchanged;

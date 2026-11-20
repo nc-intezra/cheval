@@ -366,6 +366,59 @@ or
 .BR bearer ,
 .BR headers ,
 .BR client_cert .
+.SS RPM repositories and ISOs (experimental)
+.TP
+.B format
+.B apt
+(default),
+.B rpm
+(a yum/dnf repository with
+.IR repodata/repomd.xml )
+or
+.B files
+(a folder of files listed in a checksum file, such as installer ISOs).
+.TP
+.BR releases ", " repos ", " arches
+Values for
+.BR {release} ,
+.B {repo}
+and
+.B {arch}
+in
+.IR url :
+one repository per combination.
+.B arches
+takes RPM names
+.RB ( x86_64 ).
+.TP
+.B keyring
+.BR rpm :
+checks
+.IR repomd.xml.asc .
+.BR files :
+checks
+.BR signature .
+.TP
+.B metalink
+.B rpm
+only: a Fedora metalink (placeholders allowed) whose checksum
+.I repomd.xml
+must match; for repositories that do not sign it (EPEL).
+.TP
+.BR checksums ", " signature ", " include
+.B files
+only: the checksum lists (GNU or BSD style), the signature of the first one (detached or
+clear-signed), and the names to take
+.RB ( *
+and
+.B ?
+wildcards; a pattern matching nothing is an error).
+.PP
+Source packages are never fetched. Each repository of an entry is published on its own,
+.I repomd.xml
+last; a repository with a package that could not be fetched keeps its previous state.
+See
+.IR /usr/share/doc/cheval/examples/rpm-targets.toml .
 .SS [daemon]
 .TP
 .B schedule

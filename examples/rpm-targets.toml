@@ -1,0 +1,129 @@
+# cheval: RPM repositories and installer ISOs (format = "rpm" and "files", experimental in 0.8.0)
+#
+# Add these [[repo]] entries to your cheval.toml (they sit beside the APT entries).
+# Placeholders {release}, {repo} and {arch} in `url` are filled from `releases`, `repos` and
+# `arches`: one repository per combination. Source and debug-info packages are never fetched.
+#
+# Keys: put each distribution's RPM-GPG-KEY files in a directory and point `keyring` at it
+# (a file or a directory of .asc/.gpg keys). For example:
+#   /etc/cheval/keys/rocky/RPM-GPG-KEY-Rocky-9       https://dl.rockylinux.org/pub/rocky/RPM-GPG-KEY-Rocky-9
+#   /etc/cheval/keys/centos/RPM-GPG-KEY-CentOS-6     https://vault.centos.org/RPM-GPG-KEY-CentOS-6
+#   /etc/cheval/keys/centos/RPM-GPG-KEY-CentOS-7     https://vault.centos.org/RPM-GPG-KEY-CentOS-7
+#   /etc/cheval/keys/centos/RPM-GPG-KEY-CentOS-Official
+# Check fingerprints against the distributions' published values before trusting them.
+#
+# Trust, per repository: repomd.xml.asc checked with `keyring` when upstream publishes one;
+# otherwise the checksum in `metalink` (EPEL); otherwise HTTPS alone, with a warning.
+# Start with:  cheval probe <url>   then   cheval sync --dry-run --only <name>
+
+# ---------------------------------------------------------------- Rocky Linux 9
+
+[[repo]]
+name     = "rocky"
+format   = "rpm"
+url      = "https://dl.rockylinux.org/pub/rocky/{release}/{repo}/{arch}/os/"
+releases = ["9"]
+repos    = ["BaseOS", "AppStream", "CRB"]
+arches   = ["x86_64"]
+keyring  = "/etc/cheval/keys/rocky"
+
+# The DVD once, under its `latest` name: replaced when Rocky publishes a new point release.
+[[repo]]
+name      = "rocky-isos"
+format    = "files"
+url       = "https://dl.rockylinux.org/pub/rocky/{release}/isos/{arch}/"
+releases  = ["9"]
+arches    = ["x86_64"]
+checksums = ["CHECKSUM"]
+signature = "CHECKSUM.asc"
+include   = ["Rocky-9-latest-x86_64-dvd.iso"]
+keyring   = "/etc/cheval/keys/rocky"
+
+# ---------------------------------------------------------------- CentOS Stream 9
+
+[[repo]]
+name     = "stream9"
+format   = "rpm"
+url      = "https://mirror.stream.centos.org/{release}/{repo}/{arch}/os/"
+releases = ["9-stream"]
+repos    = ["BaseOS", "AppStream", "CRB"]
+arches   = ["x86_64"]
+keyring  = "/etc/cheval/keys/centos"
+
+# Stream publishes no signature for its ISO checksums: HTTPS is the protection.
+[[repo]]
+name      = "stream9-isos"
+format    = "files"
+url       = "https://mirror.stream.centos.org/9-stream/BaseOS/x86_64/iso/"
+checksums = ["CentOS-Stream-9-latest-x86_64-dvd1.iso.SHA256SUM"]
+include   = ["CentOS-Stream-9-latest-x86_64-dvd1.iso"]
+
+# ---------------------------------------------------------------- CentOS Stream 8 (end of life, vault)
+
+[[repo]]
+name     = "stream8"
+format   = "rpm"
+url      = "https://vault.centos.org/{release}/{repo}/{arch}/os/"
+releases = ["8-stream"]
+repos    = ["BaseOS", "AppStream", "extras"]
+arches   = ["x86_64"]
+keyring  = "/etc/cheval/keys/centos"
+
+[[repo]]
+name      = "stream8-isos"
+format    = "files"
+url       = "https://vault.centos.org/8-stream/isos/x86_64/"
+checksums = ["CHECKSUM"]
+include   = ["CentOS-Stream-8-*-x86_64-dvd1.iso"]
+
+# ---------------------------------------------------------------- CentOS 6 and 7 (end of life, vault)
+
+[[repo]]
+name     = "centos-vault"
+format   = "rpm"
+url      = "https://vault.centos.org/{release}/{repo}/{arch}/"
+releases = ["6.10", "7.9.2009"]
+repos    = ["os", "updates", "extras"]
+arches   = ["x86_64"]
+keyring  = "/etc/cheval/keys/centos"
+
+# CentOS 7: the later DVD respin only. sha256sum.txt.asc is a clear-signed copy of the list.
+[[repo]]
+name      = "centos7-isos"
+format    = "files"
+url       = "https://vault.centos.org/7.9.2009/isos/x86_64/"
+checksums = ["sha256sum.txt"]
+signature = "sha256sum.txt.asc"
+include   = ["CentOS-7-x86_64-DVD-2207-02.iso"]
+keyring   = "/etc/cheval/keys/centos"
+
+# CentOS 6: the DVD comes in two parts.
+[[repo]]
+name      = "centos6-isos"
+format    = "files"
+url       = "https://vault.centos.org/6.10/isos/x86_64/"
+checksums = ["sha256sum.txt"]
+signature = "sha256sum.txt.asc"
+include   = ["CentOS-6.10-x86_64-bin-DVD1.iso", "CentOS-6.10-x86_64-bin-DVD2.iso"]
+keyring   = "/etc/cheval/keys/centos"
+
+# ---------------------------------------------------------------- EPEL
+
+# EPEL 8 and 9: repomd.xml is unsigned; the Fedora metalink carries its checksum.
+[[repo]]
+name     = "epel"
+format   = "rpm"
+url      = "https://dl.fedoraproject.org/pub/epel/{release}/Everything/{arch}/"
+releases = ["8", "9"]
+arches   = ["x86_64"]
+metalink = "https://mirrors.fedoraproject.org/metalink?repo=epel-{release}&arch={arch}"
+
+# EPEL 6 and 7 are archived (end of life). The metalink still answers for epel-7; for
+# epel-6 there may be none, so these two rely on HTTPS. Their delta-RPM folders (drpms/)
+# are not mirrored; yum falls back to full packages.
+[[repo]]
+name     = "epel-archive"
+format   = "rpm"
+url      = "https://archives.fedoraproject.org/pub/archive/epel/{release}/{arch}/"
+releases = ["6", "7"]
+arches   = ["x86_64"]

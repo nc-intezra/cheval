@@ -12,7 +12,7 @@ install -Dm755 "$BIN" "$STAGE/usr/bin/cheval"
 install -Dm644 "$SRC/README.md" "$STAGE/usr/share/doc/cheval/README.md"
 install -Dm644 "$SRC/LICENSE" "$STAGE/usr/share/doc/cheval/copyright"
 install -Dm644 "$SRC/examples/cheval.toml" "$STAGE/usr/share/doc/cheval/examples/cheval.toml"
-for site in nginx-cheval.conf apache-cheval.conf; do
+for site in nginx-cheval.conf apache-cheval.conf rpm-targets.toml; do
     if [ -f "$SRC/examples/$site" ]; then
         install -Dm644 "$SRC/examples/$site" "$STAGE/usr/share/doc/cheval/examples/$site"
     fi

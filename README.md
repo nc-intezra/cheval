@@ -6,11 +6,13 @@
 </p>
 
 A fast, consistent, verifiable **APT repository mirror** written in Rust, with a
-terminal UI. A replacement for `apt-mirror` and Refrapt.
+terminal UI. A replacement for `apt-mirror` and Refrapt. Since 0.8.0 it also mirrors
+**RPM (yum/dnf) repositories and installer ISOs**, experimentally (see
+[RPM repositories and ISOs](#rpm-repositories-and-isos-experimental)).
 
 **Documentation:** this README, the manual page (`man cheval`), and the
 [wiki](https://github.com/nc-intezra/cheval/wiki) (configuration, everyday use, pitfalls
-and the roadmap, including planned RPM support).
+and the roadmap).
 
 ```
 ┌ cheval · /srv/cheval → /srv/cheval/mirror  RUNNING  elapsed 00:14 ─────────────────────────────┐
@@ -255,6 +257,67 @@ or set `global.proxy`. Add your inspection CA with `global.ca_bundle`.
 * For a pull-through cache rather than a full mirror, `apt-cacher-ng` or a repository
   manager (Nexus, Artifactory, Pulp, aptly) may fit better.
 
+## RPM repositories and ISOs (experimental)
+
+A `[[repo]]` entry with `format = "rpm"` mirrors a yum/dnf repository; `format = "files"`
+mirrors a folder of files listed in a checksum file, such as installer ISOs. They share
+everything else with APT entries: the run, the TUI, status streams, cleanup, snapshots,
+bundles and `ingest`. [`examples/rpm-targets.toml`](examples/rpm-targets.toml) (installed
+under `/usr/share/doc/cheval/examples/`) covers Rocky 9, CentOS Stream 8 and 9, the
+CentOS 6 and 7 vaults, EPEL 6 to 9, and their DVD ISOs.
+
+```toml
+[[repo]]
+name     = "rocky"
+format   = "rpm"
+url      = "https://dl.rockylinux.org/pub/rocky/{release}/{repo}/{arch}/os/"
+releases = ["9"]
+repos    = ["BaseOS", "AppStream", "CRB"]
+arches   = ["x86_64"]                       # RPM names, not Debian's (amd64)
+keyring  = "/etc/cheval/keys/rocky"         # checks repomd.xml.asc
+
+[[repo]]
+name      = "rocky-isos"
+format    = "files"
+url       = "https://dl.rockylinux.org/pub/rocky/{release}/isos/{arch}/"
+releases  = ["9"]
+arches    = ["x86_64"]
+checksums = ["CHECKSUM"]                    # GNU (`hash  name`) or BSD (`SHA256 (name) = hash`)
+signature = "CHECKSUM.asc"                  # detached or clear-signed
+include   = ["Rocky-9-latest-x86_64-dvd.iso"]
+keyring   = "/etc/cheval/keys/rocky"
+```
+
+- **One entry, several repositories.** `{release}`, `{repo}` and `{arch}` in `url` are
+  filled from `releases`, `repos` and `arches`; `cheval check` lists what an entry expands
+  to and where each lands (`mirror/<host>/<path>`, as for APT).
+- **Mirrored verbatim.** Every file `repodata/repomd.xml` lists is fetched and checked
+  (primary, filelists, other and their SQLite forms, comps, modules, updateinfo, zchunk);
+  packages are checked against `primary.xml`. Source packages are skipped;
+  `include_packages`, `exclude_packages` and `exclude_paths` work as for APT.
+- **Trust.** `repomd.xml.asc` is checked with `keyring` when upstream publishes it.
+  Repositories that do not sign `repomd.xml` (EPEL, Fedora) can be checked against a
+  Fedora `metalink` instead. Without either, HTTPS is the only protection and cheval
+  says so. `verify = "require"` refuses to go on without a keyring or metalink.
+- **Consistent for clients.** Packages are fetched first; then the metadata, the
+  signature, and `repomd.xml` last. A repository with a package that could not be fetched
+  keeps its previous state. The previous generation of metadata stays one more run, so
+  a client that read the old `repomd.xml` a moment earlier still finds its files.
+- **Failures stay contained.** Each repository of an entry is published or kept on its
+  own; a broken RPM repository does not stop APT repositories in the same run.
+- **ISOs.** Files are picked with `include` (`*` and `?`); a pattern that matches nothing
+  is an error. Identical files (Rocky's `latest` and versioned names) are stored once as
+  hard links. When upstream replaces a file under the same name, the new one is fetched
+  and swapped in when complete; the checksum lists are mirrored beside the files.
+- **Clients.** `cheval sources --base-url http://mirror.lan` prints a yum `.repo` stanza
+  per repository. Apache and nginx serve RPM trees as they are; zchunk metadata needs
+  HTTP range requests, which both support by default.
+- **Commands.** `probe URL` recognises an RPM repository or a checksum-listed folder and
+  suggests an entry; `verify` (`--full`) checks RPM and ISO trees offline.
+
+Not yet: per-package RPM signature checks (clients check them on install), RHEL
+(entitlement certificates), and `.rpm` packages of cheval itself.
+
 ## Serving the mirror
 
 Any static web server works; point it at `mirror_path` (or at a snapshot):
@@ -463,7 +526,8 @@ use filters for things nobody installs (debug symbols, old kernels, other flavou
 The [wiki](https://github.com/nc-intezra/cheval/wiki) keeps a fuller list of pitfalls and
 the plans for what comes next.
 
-* HTTP and HTTPS upstreams only (no rsync/ftp); APT repositories only (no RPM).
+* HTTP and HTTPS upstreams only (no rsync/ftp). RPM and ISO support is experimental in
+  0.8.0 (see [RPM repositories and ISOs](#rpm-repositories-and-isos-experimental)).
 * Signature checks are cryptographic against the keys in `keyring`; key expiry and
   revocation are not evaluated — keep keyrings current.
 * A package replaced upstream under the same file name is swapped atomically, but
@@ -487,6 +551,7 @@ The code is a Cargo workspace. Lower crates never depend on higher ones:
 | `crates/cheval-core` | configuration, HTTP client, hashing, OpenPGP, progress, run summary, run lock, schedules, logo |
 | `crates/cheval-status` | status messages, UDP/TCP/syslog sinks, the HTTP API, `status listen` |
 | `crates/cheval-apt` | the APT backend: Release and index parsing, the sync engine, verify, probe, import |
+| `crates/cheval-rpm` | the RPM and files backends: repomd/primary/metalink parsing, checksum lists, sync, verify |
 | `crates/cheval-bundle` | bundles and snapshots (format-agnostic: they work on the mirror tree as files) |
 | `crates/cheval-tui` | the terminal UI and the plain progress output |
 | `cheval` (top level) | the binary; `daemon` and `ingest`, which tie the others together |

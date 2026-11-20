@@ -956,4 +956,33 @@ mod tests {
             assert!(e.contains(want), "{body}: {e}");
         }
     }
+
+    /// examples/rpm-targets.toml is valid and expands as documented.
+    #[test]
+    fn rpm_example_configuration() {
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let text = include_str!("../../../examples/rpm-targets.toml").replace("/etc/cheval/keys/rocky", dir).replace("/etc/cheval/keys/centos", dir);
+        let cfg = parse(&text).unwrap();
+        let counts: Vec<(&str, usize)> =
+            cfg.repos.iter().map(|r| (r.name.as_str(), r.targets(&cfg.global).unwrap().len())).collect();
+        assert_eq!(
+            counts,
+            vec![
+                ("rocky", 3),
+                ("rocky-isos", 1),
+                ("stream9", 3),
+                ("stream9-isos", 1),
+                ("stream8", 3),
+                ("stream8-isos", 1),
+                ("centos-vault", 6),
+                ("centos7-isos", 1),
+                ("centos6-isos", 1),
+                ("epel", 2),
+                ("epel-archive", 2),
+            ]
+        );
+        let vault: Vec<String> = cfg.repos[6].targets(&cfg.global).unwrap().iter().map(|t| t.url.to_string()).collect();
+        assert_eq!(vault[0], "https://vault.centos.org/6.10/os/x86_64/");
+        assert_eq!(vault[5], "https://vault.centos.org/7.9.2009/extras/x86_64/");
+    }
 }
