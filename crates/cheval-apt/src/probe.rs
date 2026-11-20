@@ -114,6 +114,12 @@ pub async fn run(args: ProbeArgs) -> Result<bool> {
     let g: &Global = &cfg.global;
     let rh = RepoHttp::new(0, &cfg.repos[0], g)?;
     println!("Probing {}", rh.base);
+    if let Some(ok) = probe_rpm(&rh).await? {
+        return Ok(ok);
+    }
+    if let Some(ok) = probe_files(&rh).await? {
+        return Ok(ok);
+    }
 
     let mut errors = Vec::new();
     let mut found: Vec<Found> = Vec::new();
@@ -284,4 +290,132 @@ pub async fn run(args: ProbeArgs) -> Result<bool> {
         println!("user_agent = {:?}", args.user_agent.as_deref().unwrap_or(""));
     }
     Ok(true)
+}
+
+/// An RPM (yum/dnf) repository at the URL: describe it and suggest an entry.
+async fn probe_rpm(rh: &RepoHttp) -> Result<Option<bool>> {
+    let body = match get(rh, "repodata/repomd.xml", 16 << 20).await {
+        Ok(b) => b,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => {
+            println!("  repodata/repomd.xml: {e}");
+            return Ok(None);
+        }
+    };
+    let md = match cheval_rpm::meta::parse_repomd(&body.data) {
+        Ok(m) => m,
+        Err(e) => {
+            println!("  repodata/repomd.xml is there but unreadable: {e:#}");
+            return Ok(Some(false));
+        }
+    };
+    println!(
+        "  RPM repository (repodata/repomd.xml){}",
+        md.revision.as_ref().map(|r| format!(", revision {r}")).unwrap_or_default()
+    );
+    let kinds: Vec<&str> = md.entries.iter().map(|e| e.kind.as_str()).collect();
+    println!("  metadata: {}", kinds.join(", "));
+    let meta_bytes: u64 = md.entries.iter().filter_map(|e| e.size).sum();
+    let signed = get(rh, "repodata/repomd.xml.asc", 1 << 20).await.is_ok();
+    println!(
+        "  signature: {}",
+        if signed {
+            "repomd.xml.asc (set `keyring` to the distribution's RPM-GPG-KEY)"
+        } else {
+            "none: repomd.xml is unsigned (EPEL/Fedora: set `metalink`; otherwise HTTPS is the only protection)"
+        }
+    );
+    let mut ok = true;
+    if let Some(p) = md.primary() {
+        match get(rh, &p.href, 1 << 30).await {
+            Ok(b) => {
+                let dir = tempfile_dir()?;
+                let name = p.href.rsplit('/').next().unwrap_or("primary.xml");
+                let path = dir.join(name);
+                std::fs::write(&path, &b.data)?;
+                let (mut n, mut src, mut bytes) = (0u64, 0u64, 0u64);
+                let res = crate::util::open_decoded(&path).and_then(|r| {
+                    cheval_rpm::meta::read_primary(r, |pkg| {
+                        if pkg.is_source() {
+                            src += 1;
+                        } else {
+                            n += 1;
+                            bytes += pkg.size;
+                        }
+                        Ok(())
+                    })
+                });
+                let _ = std::fs::remove_dir_all(&dir);
+                match res {
+                    Ok(_) => println!(
+                        "  packages: {n} ({}), plus {src} source package(s) cheval skips; metadata {}",
+                        human_bytes(bytes),
+                        human_bytes(meta_bytes)
+                    ),
+                    Err(e) => {
+                        println!("  primary metadata unreadable: {e:#}");
+                        ok = false;
+                    }
+                }
+            }
+            Err(e) => {
+                println!("  {}: {e}", p.href);
+                ok = false;
+            }
+        }
+    } else {
+        println!("  repomd.xml lists no primary metadata");
+        ok = false;
+    }
+    println!(
+        "\nSuggested configuration (replace the version, section and architecture in the URL with {{release}}, {{repo}}, {{arch}} to cover several):\n"
+    );
+    println!("[[repo]]\nname   = \"CHANGE-ME\"\nformat = \"rpm\"\nurl    = \"{}\"", rh.base);
+    if signed {
+        println!("keyring = \"/etc/cheval/keys/RPM-GPG-KEY-CHANGE-ME\"");
+    } else {
+        println!("# metalink = \"https://mirrors.fedoraproject.org/metalink?repo=epel-{{release}}&arch={{arch}}\"");
+    }
+    Ok(Some(ok))
+}
+
+fn tempfile_dir() -> Result<std::path::PathBuf> {
+    let d = std::env::temp_dir().join(format!("cheval-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&d)?;
+    Ok(d)
+}
+
+/// A folder of files with a checksum list (installer ISOs): list them and suggest an entry.
+async fn probe_files(rh: &RepoHttp) -> Result<Option<bool>> {
+    for list in ["CHECKSUM", "SHA256SUM", "SHA256SUMS", "sha256sum.txt"] {
+        let Ok(body) = get(rh, list, 4 << 20).await else { continue };
+        let Ok(listed) = cheval_rpm::sums::parse(&String::from_utf8_lossy(&body.data)) else { continue };
+        println!("  folder of files listed in {list} ({} entries)", listed.len());
+        let mut sig = None;
+        for cand in [format!("{list}.asc"), format!("{list}.sig"), format!("{list}.gpg")] {
+            if get(rh, &cand, 1 << 20).await.is_ok() {
+                sig = Some(cand);
+                break;
+            }
+        }
+        println!("  signature: {}", sig.as_deref().unwrap_or("none found (HTTPS is the only protection)"));
+        for (name, l) in &listed {
+            let size = l.size.map(human_bytes).unwrap_or_else(|| "size not listed".into());
+            println!("    {name:<56} {size}");
+        }
+        let dvd: Vec<&String> =
+            listed.keys().filter(|n| n.to_ascii_lowercase().contains("dvd") && n.ends_with(".iso")).collect();
+        println!("\nSuggested configuration:\n");
+        println!(
+            "[[repo]]\nname      = \"CHANGE-ME\"\nformat    = \"files\"\nurl       = \"{}\"\nchecksums = [\"{list}\"]",
+            rh.base
+        );
+        if let Some(s) = &sig {
+            println!("signature = \"{s}\"\nkeyring   = \"/etc/cheval/keys/CHANGE-ME\"");
+        }
+        let inc: Vec<String> = dvd.iter().map(|n| format!("\"{n}\"")).collect();
+        println!("include   = [{}]", if inc.is_empty() { "\"*.iso\"".to_string() } else { inc.join(", ") });
+        return Ok(Some(true));
+    }
+    Ok(None)
 }

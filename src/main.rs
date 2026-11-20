@@ -466,6 +466,34 @@ fn real_main(cli: Cli) -> Result<i32> {
             let g = &cfg.global;
             println!("configuration OK: {} repositories, mirror at {}", cfg.repos.len(), g.mirror_path().display());
             for r in &cfg.repos {
+                if r.format != cheval::config::Format::Apt {
+                    let trust = match (r.verify(g), &r.keyring, &r.metalink, r.format) {
+                        (cheval::config::VerifyMode::Off, ..) => "off",
+                        (_, Some(_), _, cheval::config::Format::Rpm) => "repomd.xml signature",
+                        (_, _, Some(_), _) => "metalink",
+                        (_, Some(_), _, _) if r.signature.is_some() => "signed checksum list",
+                        _ => "NONE (HTTPS only)",
+                    };
+                    println!(
+                        "  {:<24} format={}{}  verify={trust} clean={:?}",
+                        r.name,
+                        r.format,
+                        if r.enabled { "" } else { "  (disabled)" },
+                        r.clean(g)
+                    );
+                    for t in r.targets(g)? {
+                        println!("      {:<22} {}\n      {:<22} -> {}", t.label, t.url, "", t.dir.display());
+                    }
+                    if r.format == cheval::config::Format::Files {
+                        println!(
+                            "      checksums [{}]{} include [{}]",
+                            r.checksums.join(" "),
+                            r.signature.as_ref().map(|s| format!(" signature {s}")).unwrap_or_default(),
+                            if r.include.is_empty() { "everything listed".to_string() } else { r.include.join(" ") }
+                        );
+                    }
+                    continue;
+                }
                 println!(
                     "  {:<24} {}{}\n      -> {}\n      suites [{}] components [{}] architectures [{}]{} verify={} clean={:?}",
                     r.name,
@@ -513,6 +541,26 @@ fn real_main(cli: Cli) -> Result<i32> {
             let g = &cfg.global;
             let base = base_url.trim_end_matches('/');
             for r in cfg.repos.iter().filter(|r| r.enabled) {
+                if r.format != cheval::config::Format::Apt {
+                    for t in r.targets(g)? {
+                        let rel = t.dir.strip_prefix(g.mirror_path()).unwrap_or(&t.dir).to_string_lossy().into_owned();
+                        let url = format!("{base}/{rel}/");
+                        if r.format == cheval::config::Format::Files {
+                            println!("# {} {}: files (not a package repository) at {url}\n", r.name, t.label);
+                            continue;
+                        }
+                        // A yum/dnf .repo stanza; save as /etc/yum.repos.d/<name>.repo.
+                        let id: String = format!("{}-{}", r.name, t.label)
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                            .collect();
+                        println!(
+                            "[{id}]\nname={} {} (cheval mirror)\nbaseurl={url}\nenabled=1\ngpgcheck=1\n# gpgkey=file:///etc/pki/rpm-gpg/<key>\n",
+                            r.name, t.label
+                        );
+                    }
+                    continue;
+                }
                 let root = r.root(g)?;
                 let rel = root.strip_prefix(g.mirror_path()).unwrap_or(&root).to_string_lossy().into_owned();
                 let url = format!("{base}/{rel}");

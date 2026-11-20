@@ -1,7 +1,8 @@
 name: cross
 # The release build (static musl binaries for amd64, arm64 and armhf, the .deb) on every push
 # that changes Rust code, without publishing anything. A release tag should only ever be
-# pushed on a commit where this is green.
+# pushed on a commit where this is green. The binaries and .debs are kept as workflow
+# artifacts (14 days), so a development build can be tried before a release.
 on:
   push:
     paths: ["Cargo.toml", "Cargo.lock", "src/**", "crates/**", "packaging/**", ".github/workflows/cross.yml"]
@@ -46,3 +47,11 @@ jobs:
           if [ "${{ matrix.deb_arch }}" = amd64 ]; then
             sudo dpkg -i "$deb" && cheval --version && man -w cheval && sudo dpkg -r cheval
           fi
+      - name: Keep the build as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cheval-${{ github.ref_name }}-${{ matrix.deb_arch }}
+          path: |
+            dist/*.deb
+            target/${{ matrix.target }}/release/cheval
+          retention-days: 14
