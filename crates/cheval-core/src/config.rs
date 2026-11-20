@@ -156,14 +156,73 @@ pub struct Auth {
     pub client_cert: Option<PathBuf>,
 }
 
+/// What kind of repository a `[[repo]]` entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Format {
+    /// Debian/Ubuntu: `dists/` and `pool/`.
+    #[default]
+    Apt,
+    /// yum/dnf: `repodata/repomd.xml` and the packages it lists.
+    Rpm,
+    /// A folder of files listed in a checksum file (installer ISOs and the like).
+    Files,
+}
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Format::Apt => "apt",
+            Format::Rpm => "rpm",
+            Format::Files => "files",
+        })
+    }
+}
+
+/// One concrete repository of an `rpm` or `files` entry, with its template filled in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    /// `9/BaseOS/x86_64`: the values that were filled in, for messages.
+    pub label: String,
+    pub url: Url,
+    /// Local directory of this repository (below mirror_path).
+    pub dir: PathBuf,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Repo {
     pub name: String,
+    /// `apt` (default), `rpm` or `files`.
+    #[serde(default)]
+    pub format: Format,
+    /// For `rpm` and `files` it may hold `{release}`, `{repo}` and `{arch}`, filled in from
+    /// `releases`, `repos` and `arches`: one repository per combination.
     pub url: String,
     /// Suites/codenames (`bookworm`, `noble-updates`). A value ending in `/`
-    /// (for example `./`) denotes a flat repository directory.
+    /// (for example `./`) denotes a flat repository directory. APT only.
+    #[serde(default)]
     pub suites: Vec<String>,
+    /// `rpm`/`files`: values for `{release}` in `url`.
+    #[serde(default)]
+    pub releases: Vec<String>,
+    /// `rpm`/`files`: values for `{repo}` in `url` (BaseOS, AppStream, …).
+    #[serde(default)]
+    pub repos: Vec<String>,
+    /// `rpm`/`files`: values for `{arch}` in `url` (x86_64, aarch64, …).
+    #[serde(default)]
+    pub arches: Vec<String>,
+    /// `rpm`: Fedora-style metalink (may use the same placeholders); the checksum of
+    /// `repomd.xml` must match it. For repositories that do not sign `repomd.xml` (EPEL).
+    pub metalink: Option<String>,
+    /// `files`: checksum lists in the folder (`CHECKSUM`, `sha256sum.txt`, …); GNU or BSD style.
+    #[serde(default)]
+    pub checksums: Vec<String>,
+    /// `files`: signature of the (first) checksum list: detached or clear-signed.
+    pub signature: Option<String>,
+    /// `files`: only these names (`*` and `?` wildcards). Default: everything listed.
+    #[serde(default)]
+    pub include: Vec<String>,
     #[serde(default = "d_components")]
     pub components: Vec<String>,
     pub architectures: Option<Vec<String>>,
@@ -430,10 +489,69 @@ impl Global {
     }
 }
 
+const PLACEHOLDERS: [&str; 3] = ["{release}", "{repo}", "{arch}"];
+
 impl Repo {
-    /// Repository URL with credentials stripped and a guaranteed trailing slash.
+    /// The part of `url` before the first placeholder, up to its last `/`: the directory all
+    /// of an entry's repositories live under (the whole URL when there is no placeholder).
+    pub fn url_prefix(&self) -> &str {
+        match PLACEHOLDERS.iter().filter_map(|p| self.url.find(p)).min() {
+            Some(i) => &self.url[..=self.url[..i].rfind('/').unwrap_or(0)],
+            None => &self.url,
+        }
+    }
+
+    /// The repositories of an `rpm` or `files` entry: one per combination of the values
+    /// its URL uses, in configuration order.
+    pub fn targets(&self, g: &Global) -> Result<Vec<Target>> {
+        let lists: [(&str, &Vec<String>); 3] =
+            [("{release}", &self.releases), ("{repo}", &self.repos), ("{arch}", &self.arches)];
+        let mut combos: Vec<(String, Vec<String>)> = vec![(self.url.clone(), Vec::new())];
+        for (ph, values) in lists {
+            if !self.url.contains(ph) {
+                continue;
+            }
+            combos = combos
+                .into_iter()
+                .flat_map(|(u, label)| {
+                    values.iter().map(move |v| {
+                        let mut l = label.clone();
+                        l.push(v.clone());
+                        (u.replace(ph, v), l)
+                    })
+                })
+                .collect();
+        }
+        let prefix_root = self.root(g)?;
+        let prefix = Url::parse(self.url_prefix()).with_context(|| format!("repo {}: bad url", self.name))?;
+        combos
+            .into_iter()
+            .map(|(u, label)| {
+                let mut url = Url::parse(&u).with_context(|| format!("repo {}: bad url {u}", self.name))?;
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                if !url.path().ends_with('/') {
+                    let p = format!("{}/", url.path());
+                    url.set_path(&p);
+                }
+                let rest = url.path().strip_prefix(prefix.path()).unwrap_or("").to_string();
+                let rest = percent_encoding::percent_decode_str(&rest).decode_utf8_lossy().into_owned();
+                let rest = rest.trim_matches('/');
+                let dir = if rest.is_empty() {
+                    prefix_root.clone()
+                } else {
+                    prefix_root
+                        .join(crate::util::safe_rel_path(rest).with_context(|| format!("repo {}: {u}", self.name))?)
+                };
+                Ok(Target { label: if label.is_empty() { self.name.clone() } else { label.join("/") }, url, dir })
+            })
+            .collect()
+    }
+
+    /// Repository URL with credentials stripped and a guaranteed trailing slash. For an entry
+    /// with placeholders: the directory above the first one.
     pub fn base_url(&self) -> Result<Url> {
-        let mut u = Url::parse(&self.url).with_context(|| format!("repo {}: bad url", self.name))?;
+        let mut u = Url::parse(self.url_prefix()).with_context(|| format!("repo {}: bad url", self.name))?;
         if !matches!(u.scheme(), "http" | "https") {
             bail!("repo {}: only http and https URLs are supported (got {})", self.name, u.scheme());
         }
@@ -547,14 +665,76 @@ impl Config {
             r.base_url()?;
             r.root(g)?;
             r.filters()?;
-            if r.suites.is_empty() {
-                bail!("repo {}: at least one suite is required", r.name);
-            }
-            for s in &r.suites {
-                Repo::dist_dir(s).with_context(|| format!("repo {}: suite {s:?}", r.name))?;
-            }
-            if r.architectures(g).is_empty() && !r.source(g) {
-                bail!("repo {}: no architectures and no source — nothing to mirror", r.name);
+            match r.format {
+                Format::Apt => {
+                    if r.suites.is_empty() {
+                        bail!("repo {}: at least one suite is required", r.name);
+                    }
+                    for s in &r.suites {
+                        Repo::dist_dir(s).with_context(|| format!("repo {}: suite {s:?}", r.name))?;
+                    }
+                    if r.architectures(g).is_empty() && !r.source(g) {
+                        bail!("repo {}: no architectures and no source — nothing to mirror", r.name);
+                    }
+                    let rpm_only = [
+                        ("releases", r.releases.is_empty()),
+                        ("repos", r.repos.is_empty()),
+                        ("arches", r.arches.is_empty()),
+                        ("metalink", r.metalink.is_none()),
+                        ("checksums", r.checksums.is_empty()),
+                        ("signature", r.signature.is_none()),
+                        ("include", r.include.is_empty()),
+                    ];
+                    if let Some((k, _)) = rpm_only.iter().find(|(_, unset)| !unset) {
+                        bail!("repo {}: `{k}` is for format = \"rpm\" or \"files\"", r.name);
+                    }
+                }
+                Format::Rpm | Format::Files => {
+                    if !r.suites.is_empty() {
+                        bail!(
+                            "repo {}: `suites` is for APT; RPM and files entries use `releases`, `repos` and `arches`",
+                            r.name
+                        );
+                    }
+                    for (ph, values, key) in [
+                        ("{release}", &r.releases, "releases"),
+                        ("{repo}", &r.repos, "repos"),
+                        ("{arch}", &r.arches, "arches"),
+                    ] {
+                        match (r.url.contains(ph), values.is_empty()) {
+                            (true, true) => bail!("repo {}: the url uses {ph} but `{key}` is empty", r.name),
+                            (false, false) => bail!("repo {}: `{key}` is set but the url has no {ph}", r.name),
+                            _ => {}
+                        }
+                        for v in values {
+                            if v.is_empty() || v.contains('/') || v == "." || v == ".." {
+                                bail!("repo {}: {key} value {v:?} must be one path segment", r.name);
+                            }
+                        }
+                    }
+                    let targets = r.targets(g)?;
+                    if targets.is_empty() {
+                        bail!("repo {}: nothing to mirror", r.name);
+                    }
+                    if r.format == Format::Files {
+                        if r.checksums.is_empty() {
+                            bail!(
+                                "repo {}: format = \"files\" needs `checksums` (the file listing the files and their hashes)",
+                                r.name
+                            );
+                        }
+                        for c in r.checksums.iter().chain(r.signature.iter()) {
+                            if c.contains('/') || c.is_empty() {
+                                bail!("repo {}: {c:?} must be a file name in the folder", r.name);
+                            }
+                        }
+                    } else if !r.checksums.is_empty() || r.signature.is_some() || !r.include.is_empty() {
+                        bail!("repo {}: `checksums`, `signature` and `include` are for format = \"files\"", r.name);
+                    }
+                    if r.format == Format::Files && r.metalink.is_some() {
+                        bail!("repo {}: `metalink` is for format = \"rpm\"", r.name);
+                    }
+                }
             }
             for e in &r.extra_files {
                 crate::util::safe_rel_path(e).with_context(|| format!("repo {}: extra_files", r.name))?;
@@ -653,5 +833,120 @@ mod tests {
         assert_eq!(r.base_url().unwrap().as_str(), "https://h.example:8443/r/");
         assert_eq!(r.url_credentials(), Some(("u".into(), "p@ss".into())));
         assert_eq!(r.root(&cfg.global).unwrap(), PathBuf::from("/x/mirror/h.example:8443/r"));
+    }
+
+    fn parse(extra: &str) -> Result<Config> {
+        let cfg: Config = toml::from_str(&format!("[global]\nbase_path = \"/srv/cheval\"\n{extra}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn rpm_templates_expand_in_order() {
+        let cfg = parse(
+            r#"
+            [[repo]]
+            name     = "rocky"
+            format   = "rpm"
+            url      = "https://dl.rockylinux.org/pub/rocky/{release}/{repo}/{arch}/os/"
+            releases = ["9"]
+            repos    = ["BaseOS", "AppStream", "CRB"]
+            arches   = ["x86_64"]
+            "#,
+        )
+        .unwrap();
+        let r = &cfg.repos[0];
+        assert_eq!(r.format, Format::Rpm);
+        assert_eq!(r.root(&cfg.global).unwrap(), PathBuf::from("/srv/cheval/mirror/dl.rockylinux.org/pub/rocky"));
+        let t = r.targets(&cfg.global).unwrap();
+        let got: Vec<(&str, &str, PathBuf)> =
+            t.iter().map(|t| (t.label.as_str(), t.url.as_str(), t.dir.clone())).collect();
+        let m = PathBuf::from("/srv/cheval/mirror/dl.rockylinux.org/pub/rocky");
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "9/BaseOS/x86_64",
+                    "https://dl.rockylinux.org/pub/rocky/9/BaseOS/x86_64/os/",
+                    m.join("9/BaseOS/x86_64/os")
+                ),
+                (
+                    "9/AppStream/x86_64",
+                    "https://dl.rockylinux.org/pub/rocky/9/AppStream/x86_64/os/",
+                    m.join("9/AppStream/x86_64/os")
+                ),
+                ("9/CRB/x86_64", "https://dl.rockylinux.org/pub/rocky/9/CRB/x86_64/os/", m.join("9/CRB/x86_64/os")),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_without_placeholders_are_one_repository() {
+        let cfg = parse(
+            r#"
+            [[repo]]
+            name      = "c7-isos"
+            format    = "files"
+            url       = "https://vault.centos.org/7.9.2009/isos/x86_64/"
+            checksums = ["sha256sum.txt"]
+            signature = "sha256sum.txt.asc"
+            include   = ["CentOS-7-x86_64-DVD-2207-02.iso"]
+            "#,
+        )
+        .unwrap();
+        let t = cfg.repos[0].targets(&cfg.global).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].label, "c7-isos");
+        assert_eq!(t[0].dir, PathBuf::from("/srv/cheval/mirror/vault.centos.org/7.9.2009/isos/x86_64"));
+    }
+
+    #[test]
+    fn rpm_and_files_settings_are_checked() {
+        let bad = [
+            (
+                r#"format = "rpm"
+                url = "https://x/{release}/os/""#,
+                "releases` is empty",
+            ),
+            (
+                r#"format = "rpm"
+                url = "https://x/os/"
+                arches = ["x86_64"]"#,
+                "url has no {arch}",
+            ),
+            (
+                r#"format = "rpm"
+                url = "https://x/{repo}/"
+                repos = ["../etc"]"#,
+                "one path segment",
+            ),
+            (
+                r#"format = "rpm"
+                url = "https://x/os/"
+                suites = ["stable"]"#,
+                "`suites` is for APT",
+            ),
+            (
+                r#"format = "files"
+                url = "https://x/isos/""#,
+                "needs `checksums`",
+            ),
+            (
+                r#"url = "https://x/debian"
+                suites = ["stable"]
+                arches = ["x86_64"]"#,
+                "`arches` is for format",
+            ),
+            (
+                r#"format = "rpm"
+                url = "https://x/os/"
+                include = ["*.iso"]"#,
+                "are for format = \"files\"",
+            ),
+        ];
+        for (body, want) in bad {
+            let e = parse(&format!("[[repo]]\nname = \"x\"\n{body}")).unwrap_err().to_string();
+            assert!(e.contains(want), "{body}: {e}");
+        }
     }
 }

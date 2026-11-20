@@ -220,6 +220,29 @@ pub fn link_or_copy_atomic(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::rename(&tmp, dst)
 }
 
+/// Shell-style wildcard match of a whole file name: `*` any run of characters, `?` one.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +262,16 @@ mod tests {
         assert_eq!(parse_size("2MiB/s").unwrap(), 2 << 20);
         assert_eq!(parse_size("123").unwrap(), 123);
         assert_eq!(split_compression("a/Packages.xz"), ("a/Packages", ".xz"));
+    }
+
+    #[test]
+    fn wildcards() {
+        assert!(glob_match("Rocky-9-latest-x86_64-dvd.iso", "Rocky-9-latest-x86_64-dvd.iso"));
+        assert!(glob_match("CentOS-6.10-x86_64-bin-DVD?.iso", "CentOS-6.10-x86_64-bin-DVD2.iso"));
+        assert!(glob_match("*-dvd*.iso", "CentOS-Stream-8-20240603.0-x86_64-dvd1.iso"));
+        assert!(glob_match("*", "anything"));
+        assert!(!glob_match("*-dvd*.iso", "CentOS-Stream-8-20240603.0-x86_64-dvd1.iso.manifest"));
+        assert!(!glob_match("CentOS-7-x86_64-DVD-*.iso", "CentOS-7-x86_64-Everything-2009.iso"));
+        assert!(!glob_match("a?c", "ac"));
     }
 }

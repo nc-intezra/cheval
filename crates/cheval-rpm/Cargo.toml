@@ -1,0 +1,27 @@
+[package]
+name = "cheval-rpm"
+description = "cheval RPM backend: repomd.xml and primary.xml parsing, metalinks, checksum lists, and the rpm and files sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cheval-core.workspace = true
+cheval-status.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+flate2.workspace = true
