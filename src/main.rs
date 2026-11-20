@@ -62,6 +62,9 @@ enum Cmd {
         full: bool,
         #[arg(long = "only", value_name = "NAME")]
         only: Vec<String>,
+        /// No progress bar (on a terminal) or progress lines (in a log) on stderr
+        #[arg(long)]
+        no_progress: bool,
     },
     /// Inspect an unknown repository URL and print a suggested configuration
     Probe {
@@ -225,6 +228,9 @@ enum BundleCmd {
         /// bundle arrived complete)
         #[arg(long)]
         no_checksum_file: bool,
+        /// No progress bar (on a terminal) or progress lines (in a log) on stderr
+        #[arg(long)]
+        no_progress: bool,
     },
     /// Unpack a bundle into the mirror directory of this (offline) side
     Apply {
@@ -246,6 +252,9 @@ enum SnapCmd {
     /// Create a snapshot (default name: timestamp)
     Create {
         name: Option<String>,
+        /// No progress bar (on a terminal) or progress lines (in a log) on stderr
+        #[arg(long)]
+        no_progress: bool,
     },
     List,
     Delete {
@@ -542,8 +551,8 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Snapshot { cmd } => {
             let cfg = load_config(&cli.config)?;
             match cmd {
-                SnapCmd::Create { name } => {
-                    snapshot::create(&cfg.global, name)?;
+                SnapCmd::Create { name, no_progress } => {
+                    snapshot::create_with(&cfg.global, name, cheval::meter::Progress::from_flag(no_progress))?;
                 }
                 SnapCmd::List => snapshot::list(&cfg.global)?,
                 SnapCmd::Delete { name } => snapshot::delete(&cfg.global, &name)?,
@@ -552,7 +561,16 @@ fn real_main(cli: Cli) -> Result<i32> {
         }
         Cmd::Bundle { cmd } => {
             match cmd {
-                BundleCmd::Create { out, full, manifest, only, compress, no_hard_links, no_checksum_file } => {
+                BundleCmd::Create {
+                    out,
+                    full,
+                    manifest,
+                    only,
+                    compress,
+                    no_hard_links,
+                    no_checksum_file,
+                    no_progress,
+                } => {
                     let cfg = load_config(&cli.config)?;
                     let opts = bundle::CreateOptions {
                         full,
@@ -560,6 +578,7 @@ fn real_main(cli: Cli) -> Result<i32> {
                         hard_links: !no_hard_links,
                         compress,
                         checksum_file: !no_checksum_file,
+                        progress: cheval::meter::Progress::from_flag(no_progress),
                     };
                     bundle::create_with(&cfg, &only, &out, &opts)?;
                 }
@@ -581,9 +600,13 @@ fn real_main(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Cmd::Verify { full, only } => {
+        Cmd::Verify { full, only, no_progress } => {
             let cfg = load_config(&cli.config)?;
-            Ok(if verify::run(&cfg, &only, full)? { 0 } else { 1 })
+            Ok(if verify::run_with(&cfg, &only, full, cheval::meter::Progress::from_flag(no_progress))? {
+                0
+            } else {
+                1
+            })
         }
         Cmd::Sync { no_tui, dry_run, recheck, only, no_clean, force_clean, exit_when_done, verbose } => {
             let cfg = Arc::new(load_config(&cli.config)?);

@@ -6,6 +6,7 @@ pub mod config;
 pub mod http;
 pub mod lock;
 pub mod logo;
+pub mod meter;
 pub mod progress;
 pub mod schedule;
 pub mod sig;

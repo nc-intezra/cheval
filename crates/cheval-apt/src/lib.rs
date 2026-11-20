@@ -2,7 +2,7 @@
 //! and sources.list import.
 
 // Re-exported so modules keep addressing them as `crate::…`.
-pub use cheval_core::{config, http, lock, progress, sig, summary, util};
+pub use cheval_core::{config, http, lock, meter, progress, sig, summary, util};
 pub use cheval_status::status;
 
 pub mod clean;

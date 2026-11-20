@@ -2,10 +2,19 @@
 
 ## Unreleased
 
-- `bundle apply` shows progress: on a terminal, a bar with the share of the bundle read,
-  files done, speed and time left; in a log or pipe, one line every 30 seconds (so short
-  applies log nothing extra). On stderr; stdout is unchanged. `--no-progress` turns it off.
-  `ingest` shows the same while it checks and applies a bundle
+- Progress on stderr for the long operations outside `sync` (stdout is unchanged;
+  `--no-progress` turns it off). On a terminal a bar with share done, bytes, time left,
+  files and speed; in a log or pipe one line every 30 seconds, so short runs log nothing
+  extra:
+  - `bundle apply` (by bytes of the bundle read, exact for zstd too), and `ingest` while it
+    checks and applies a bundle
+  - `bundle create`: running counts while scanning, then a bar while writing
+  - `verify` / `verify --full`: per repository, by files or by bytes hashed
+  - `snapshot create`: running counts of files linked (and bytes, if it has to copy)
+- `snapshot create` says when it cannot hard-link (snapshot directory on another
+  filesystem) and is copying every file instead
+- `verify` lists a repository's index problems before its package problems (it now reads
+  all of a repository's indices before checking packages, to know the totals)
 - Fix: `bundle apply` without `--to` released the mirror lock before applying, so a sync
   could run at the same time; the lock is now held until the apply finishes
 

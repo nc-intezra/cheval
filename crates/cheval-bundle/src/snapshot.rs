@@ -4,6 +4,7 @@
 //! so a hard-linked tree is a stable, space-free copy that can be served or shipped
 //! to an offline network as an exact, repeatable state.
 use crate::config::Global;
+use crate::meter::{Counters, Meter, Progress};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use walkdir::WalkDir;
@@ -19,7 +20,13 @@ fn valid_name(name: &str) -> Result<()> {
 }
 
 pub fn link_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
+    link_tree_counted(src, dst, &Counters::default())
+}
+
+/// [`link_tree`], counting files and bytes into `counters` as it goes.
+pub fn link_tree_counted(src: &Path, dst: &Path, counters: &Counters) -> Result<(u64, u64)> {
     let (mut files, mut bytes) = (0u64, 0u64);
+    let mut told_copying = false;
     for e in WalkDir::new(src).follow_links(false) {
         let e = e?;
         let rel = e.path().strip_prefix(src).unwrap();
@@ -35,17 +42,34 @@ pub fn link_tree(src: &Path, dst: &Path) -> Result<(u64, u64)> {
             if name.ends_with(".cheval-part") || name.ends_with(".cheval-new") {
                 continue;
             }
-            if std::fs::hard_link(e.path(), &target).is_err() {
-                std::fs::copy(e.path(), &target).with_context(|| format!("copying {}", e.path().display()))?;
+            if let Err(err) = std::fs::hard_link(e.path(), &target) {
+                if !told_copying {
+                    // Usually a snapshot directory on another filesystem: this is a full copy.
+                    eprintln!(
+                        "cannot hard-link into {} ({err}); copying files instead, which takes far longer and uses space",
+                        dst.display()
+                    );
+                    told_copying = true;
+                }
+                let copied =
+                    std::fs::copy(e.path(), &target).with_context(|| format!("copying {}", e.path().display()))?;
+                // Only copies move data; links are counted as files.
+                counters.add_bytes(copied);
             }
             files += 1;
             bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            counters.file_done();
         }
     }
     Ok((files, bytes))
 }
 
 pub fn create(g: &Global, name: Option<String>) -> Result<String> {
+    create_with(g, name, Progress::Auto)
+}
+
+/// [`create`], choosing whether progress is shown.
+pub fn create_with(g: &Global, name: Option<String>, progress: Progress) -> Result<String> {
     let name = name.unwrap_or_else(|| chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
     valid_name(&name)?;
     let _lock = crate::lock::lock(g)?; // never snapshot in the middle of a publish
@@ -60,7 +84,9 @@ pub fn create(g: &Global, name: Option<String>) -> Result<String> {
     let tmp = g.snapshot_path().join(format!(".{name}.tmp"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let (files, bytes) = link_tree(&src, &tmp)?;
+    let meter = Meter::start("snapshot", None, std::sync::Arc::new(Counters::default()), progress);
+    let (files, bytes) = link_tree_counted(&src, &tmp, meter.counters())?;
+    drop(meter);
     std::fs::rename(&tmp, &dst)?;
     println!("snapshot {name}: {files} files, {} at {}", crate::util::human_bytes(bytes), dst.display());
     Ok(name)

@@ -298,7 +298,7 @@ cheval sync
 cheval bundle create /media/usb/2026-11-13.tar     # first time: full; later: only changes
 
 # isolated side (same cheval.toml, or --to DIR)
-cheval bundle apply /media/usb/2026-11-13.tar    # progress bar with time left; --no-progress for scripts
+cheval bundle apply /media/usb/2026-11-13.tar    # progress with time left on stderr; --no-progress to silence
 cheval verify --full
 ```
 

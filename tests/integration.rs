@@ -1558,6 +1558,7 @@ async fn bundles_keep_hard_links_and_can_be_compressed() {
         hard_links: links,
         compress,
         checksum_file: true,
+        progress: cheval::meter::Progress::Auto,
     };
     let (plain, zst, copies) = (base.path().join("b.tar"), base.path().join("b.tar.zst"), base.path().join("c.tar"));
     cheval::bundle::create_with(&cfg, &[], &plain, &opts("m1", true, None)).unwrap();

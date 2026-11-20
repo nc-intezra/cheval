@@ -53,7 +53,13 @@ fn ident(_meta: &std::fs::Metadata) -> Option<Ident> {
 
 /// Record every file below `dir` (which lies inside `root`) under its path relative to `root`.
 /// Metadata files are hashed on all cores; package files are tracked by size.
-fn scan_into(m: &mut Manifest, ids: &mut BTreeMap<String, Ident>, root: &Path, dir: &Path) -> Result<()> {
+fn scan_into(
+    m: &mut Manifest,
+    ids: &mut BTreeMap<String, Ident>,
+    root: &Path,
+    dir: &Path,
+    counters: &Counters,
+) -> Result<()> {
     let mut to_hash: Vec<(String, PathBuf, u64)> = Vec::new();
     for e in WalkDir::new(dir).follow_links(false) {
         let e = e?;
@@ -66,6 +72,7 @@ fn scan_into(m: &mut Manifest, ids: &mut BTreeMap<String, Ident>, root: &Path, d
         }
         let rel = e.path().strip_prefix(root).unwrap().to_string_lossy().into_owned();
         let meta = e.metadata()?;
+        counters.file_done();
         if let Some(id) = ident(&meta) {
             ids.insert(rel.clone(), id);
         }
@@ -94,7 +101,7 @@ fn scan_into(m: &mut Manifest, ids: &mut BTreeMap<String, Ident>, root: &Path, d
             }
         }
     }
-    let sums = parallel_hash(&unique.iter().map(|&i| to_hash[i].1.clone()).collect::<Vec<_>>())?;
+    let sums = parallel_hash(&unique.iter().map(|&i| to_hash[i].1.clone()).collect::<Vec<_>>(), counters)?;
     let sum_of: BTreeMap<usize, String> = unique.iter().copied().zip(sums).collect();
     for (i, (rel, _, len)) in to_hash.into_iter().enumerate() {
         m.insert(rel, (len, sum_of[&alias[i]].clone()));
@@ -103,7 +110,7 @@ fn scan_into(m: &mut Manifest, ids: &mut BTreeMap<String, Ident>, root: &Path, d
 }
 
 /// SHA-256 of each file, spread over the available cores.
-fn parallel_hash(paths: &[PathBuf]) -> Result<Vec<String>> {
+fn parallel_hash(paths: &[PathBuf], counters: &Counters) -> Result<Vec<String>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 8);
     let next = AtomicUsize::new(0);
@@ -119,6 +126,7 @@ fn parallel_hash(paths: &[PathBuf]) -> Result<Vec<String>> {
                     }
                     let r = hash_file(&paths[i], HashAlgo::Sha256)
                         .with_context(|| format!("hashing {}", paths[i].display()));
+                    counters.add_bytes(std::fs::metadata(&paths[i]).map(|m| m.len()).unwrap_or(0));
                     *results[i].lock().unwrap() = Some(r);
                 }
             });
@@ -243,11 +251,20 @@ pub struct CreateOptions {
     /// Also write `OUT.sha256` (in `sha256sum` format) once the bundle is complete, so a
     /// receiver such as `cheval ingest` knows the transfer finished and arrived intact.
     pub checksum_file: bool,
+    /// Progress on stderr while scanning and writing (see [`crate::meter`]).
+    pub progress: Progress,
 }
 
 impl Default for CreateOptions {
     fn default() -> Self {
-        CreateOptions { full: false, manifest: None, hard_links: true, compress: None, checksum_file: true }
+        CreateOptions {
+            full: false,
+            manifest: None,
+            hard_links: true,
+            compress: None,
+            checksum_file: true,
+            progress: Progress::Auto,
+        }
     }
 }
 
@@ -374,20 +391,23 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
     };
     let mut cur = Manifest::new();
     let mut ids: BTreeMap<String, Ident> = BTreeMap::new();
+    // Running counts while scanning: files looked at, index bytes hashed.
+    let scan_meter = Meter::start("scan", None, std::sync::Arc::new(Counters::default()), opts.progress);
     if whole {
         eprintln!("scanning {} ...", root.display());
-        scan_into(&mut cur, &mut ids, &root, &root)?;
+        scan_into(&mut cur, &mut ids, &root, &root, scan_meter.counters())?;
     } else {
         for dir in &scope.dirs {
             let path = root.join(dir);
             if path.is_dir() {
                 eprintln!("scanning {} ...", path.display());
-                scan_into(&mut cur, &mut ids, &root, &path)?;
+                scan_into(&mut cur, &mut ids, &root, &path, scan_meter.counters())?;
             } else if !prev.keys().any(|p| within(p, dir)) {
                 bail!("nothing has been mirrored to {} yet: run `cheval sync` first", path.display());
             }
         }
     }
+    drop(scan_meter);
     let mut changed: Vec<&String> = cur.iter().filter(|(p, v)| prev.get(*p) != Some(v)).map(|(p, _)| p).collect();
     changed.sort_by_key(|p| (rank(p), p.as_str()));
     let deleted: Vec<&String> = prev.keys().filter(|p| !cur.contains_key(*p)).collect();
@@ -442,14 +462,23 @@ fn create_scoped(g: &Global, scope: &Scope, out: &Path, opts: &CreateOptions) ->
         info["repos"] = serde_json::json!(scope.repos);
     }
     append_bytes(&mut tar, &format!("{META_DIR}/info.json"), &serde_json::to_vec_pretty(&info)?)?;
+    let meter = Meter::start("write", Some(bytes), std::sync::Arc::new(Counters::default()), opts.progress);
+    meter.set_total_files(changed.len() as u64);
     for rel in &changed {
         if let Some(target) = link_to.get(rel) {
             link_entry(&mut tar, rel, target)?;
+            meter.file_done();
             continue;
         }
-        let mut f = std::fs::File::open(root.join(rel)).with_context(|| format!("opening {rel}"))?;
-        tar.append_file(rel, &mut f).with_context(|| format!("adding {rel}"))?;
+        let f = std::fs::File::open(root.join(rel)).with_context(|| format!("opening {rel}"))?;
+        // What `append_file` writes, read through a counter for the progress meter.
+        let mut h = tar::Header::new_gnu();
+        h.set_metadata_in_mode(&f.metadata()?, tar::HeaderMode::Complete);
+        let reader = Counting { inner: f, count: meter.counters().read.clone() };
+        tar.append_data(&mut h, rel, reader).with_context(|| format!("adding {rel}"))?;
+        meter.file_done();
     }
+    drop(meter);
     let del: String = deleted.iter().map(|p| format!("{p}\n")).collect();
     append_bytes(&mut tar, &format!("{META_DIR}/delete"), del.as_bytes())?;
     let digest = tar.into_inner()?.finish()?;
@@ -550,7 +579,7 @@ pub fn apply_with(bundle: &Path, dest: &Path, keep_deleted: bool, progress: Prog
                         println!("bundle covers {} ({})", repos.join(", "), dirs.join(", "));
                         scope = Some(dirs);
                     }
-                    let m = Meter::start("apply", total, counters.clone(), progress);
+                    let m = Meter::start("apply", Some(total), counters.clone(), progress);
                     m.set_total_files(info.get("files").and_then(|v| v.as_u64()).unwrap_or(0));
                     meter = Some(m);
                 }
@@ -761,7 +790,7 @@ pub fn check_hashed_with(bundle: &Path, progress: Progress) -> Result<(BundleInf
     let counters = std::sync::Arc::new(Counters::default());
     let reader = Counting { inner: HashingReader { file, state: state.clone() }, count: counters.read.clone() };
     let (mut ar, compressed) = open_reader(Box::new(reader))?;
-    let meter = Meter::start("check", total, counters, progress);
+    let meter = Meter::start("check", Some(total), counters, progress);
     let result = check_entries(bundle, &mut ar, compressed);
     // Read to the end of the stream (tar end blocks, zstd epilogue) and of the file
     // (anything past the stream), so the hash covers every byte.

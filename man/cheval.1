@@ -110,10 +110,12 @@ starts a run now;
 stops cleanly.
 The configuration is re-read before each run.
 .TP
-.B verify \fR[\fB\-\-full\fR] [\fB\-\-only\fR \fINAME\fR]
+.B verify \fR[\fB\-\-full\fR] [\fB\-\-only\fR \fINAME\fR] [\fB\-\-no\-progress\fR]
 Check the local mirror offline against its signed indices: presence and size, or with
 .B \-\-full
 every checksum.
+Shows progress per repository (see
+.BR "PROGRESS OUTPUT" ).
 .TP
 .B check
 Validate the configuration and show what would be mirrored where.
@@ -151,11 +153,14 @@ Print the apt sources clients need to use this mirror, served under
 .IR URL .
 .SS Copies and offline transfer
 .TP
-.B snapshot create \fR[\fINAME\fR] | \fBlist\fR | \fBdelete\fR \fINAME\fR
+.B snapshot create \fR[\fINAME\fR] [\fB\-\-no\-progress\fR] | \fBlist\fR | \fBdelete\fR \fINAME\fR
 Hard-linked point-in-time copies of the mirror under
 .IR base_path /snapshots.
+When the snapshot directory is on another filesystem, hard links are impossible: cheval
+says so and copies every file instead, which takes as long as the mirror is large and uses
+as much space.
 .TP
-.B bundle create \fIOUT.tar\fR [\fB\-\-only\fR \fINAME\fR]... [\fB\-\-full\fR] [\fB\-\-compress\fR[=\fILEVEL\fR]] [\fB\-\-no\-hard\-links\fR] [\fB\-\-manifest\fR \fIFILE\fR]
+.B bundle create \fIOUT.tar\fR [\fB\-\-only\fR \fINAME\fR]... [\fB\-\-full\fR] [\fB\-\-compress\fR[=\fILEVEL\fR]] [\fB\-\-no\-hard\-links\fR] [\fB\-\-manifest\fR \fIFILE\fR] [\fB\-\-no\-progress\fR]
 Pack what changed since the previous bundle into a tar file to carry across an air gap.
 The first bundle is complete; later ones hold only changes and deletions.
 .RS
@@ -191,12 +196,6 @@ Use one per destination site.
 .TP
 .B bundle apply \fIIN.tar\fR [\fB\-\-to\fR \fIDIR\fR] [\fB\-\-keep\-deleted\fR] [\fB\-\-no\-progress\fR]
 Unpack a bundle into the mirror directory of the offline side.
-Progress goes to stderr: on a terminal, a bar with the share of the bundle read, files done,
-speed and time left; otherwise (a log, a pipe) one line every 30 seconds.
-.B \-\-no\-progress
-turns it off.
-.B ingest
-shows the same progress while it checks and applies a bundle.
 Packages are written first and Release files last; apply bundles in the order they were
 made.
 A per-repository bundle cannot write or delete outside its repository's directory,
@@ -516,6 +515,26 @@ Cron instead of the daemon or the systemd timer:
 17 3 * * *  cheval \-c /etc/cheval/cheval.toml sync \-\-no\-tui >/dev/null
 .EE
 .RE
+.SH PROGRESS OUTPUT
+.BR "bundle create" ,
+.BR "bundle apply" ,
+.BR verify ,
+.B "snapshot create"
+and
+.B ingest
+report progress on stderr; stdout is unchanged.
+On a terminal they draw one line, redrawn as they go and cleared at the end:
+a bar, the share done, bytes, time left, files and speed when a total is known
+.RB ( "bundle apply" ,
+the writing part of
+.BR "bundle create" ,
+.BR verify ),
+running counts otherwise (scanning before a bundle,
+.BR "snapshot create" ).
+Elsewhere (a log, journald, a pipe) they print one plain line every 30 seconds, so a short
+operation logs nothing extra.
+.B \-\-no\-progress
+turns it off.
 .SH EXIT STATUS
 .TP
 .B 0
