@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.1
 
 - Progress on stderr for the long operations outside `sync` (stdout is unchanged;
   `--no-progress` turns it off). On a terminal a bar with share done, bytes, time left,

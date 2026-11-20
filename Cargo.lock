@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "cheval"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "cheval-apt",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-apt"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -486,7 +486,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-bundle"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -533,7 +533,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-status"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "cheval-core",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "cheval-tui"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "cheval-core",
  "ratatui",
