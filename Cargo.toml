@@ -26,6 +26,8 @@ md-5 = "0.11.0"
 percent-encoding = "2.3.2"
 pgp = "0.21.1"
 quick-xml = "0.42.0"
+semver = "1.0.28"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 ratatui = "0.30.2"
 regex = "1.13.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "socks"] }
@@ -46,6 +48,7 @@ cheval-status = { path = "crates/cheval-status" }
 cheval-apt = { path = "crates/cheval-apt" }
 cheval-bundle = { path = "crates/cheval-bundle" }
 cheval-tui = { path = "crates/cheval-tui" }
+cheval-registry = { path = "crates/cheval-registry" }
 cheval-rpm = { path = "crates/cheval-rpm" }
 
 [package]

@@ -167,6 +167,19 @@ pub enum Format {
     Rpm,
     /// A folder of files listed in a checksum file (installer ISOs and the like).
     Files,
+    /// Rust crates from a sparse cargo index (crates.io): `index.crates.io` + `static.crates.io`.
+    Crates,
+    /// Go modules from a module proxy (`proxy.golang.org`).
+    Go,
+    /// Maven artifacts from a Maven 2 layout repository (`repo.maven.apache.org/maven2`).
+    Maven,
+}
+
+impl Format {
+    /// Package registries: a selection of packages, not a whole repository.
+    pub fn is_registry(self) -> bool {
+        matches!(self, Format::Crates | Format::Go | Format::Maven)
+    }
 }
 
 impl std::fmt::Display for Format {
@@ -175,6 +188,9 @@ impl std::fmt::Display for Format {
             Format::Apt => "apt",
             Format::Rpm => "rpm",
             Format::Files => "files",
+            Format::Crates => "crates",
+            Format::Go => "go",
+            Format::Maven => "maven",
         })
     }
 }
@@ -223,6 +239,21 @@ pub struct Repo {
     /// `files`: only these names (`*` and `?` wildcards). Default: everything listed.
     #[serde(default)]
     pub include: Vec<String>,
+    /// `crates`/`go`/`maven`: what to mirror, with everything it depends on.
+    /// crates: `serde`, `tokio@1.40` (a version requirement); go: `golang.org/x/net@v0.30.0`,
+    /// `example.com/m@latest`; maven: `group:artifact:version` (or with packaging and classifier).
+    #[serde(default)]
+    pub packages: Vec<String>,
+    /// `crates`/`go`/`maven`: exact versions from lock files: `Cargo.lock`, `go.sum`, or the
+    /// output of `mvn dependency:list` (one `group:artifact:type:version:scope` per line).
+    #[serde(default)]
+    pub lockfiles: Vec<PathBuf>,
+    /// `crates`: also follow dev-dependencies of the selected crates.
+    #[serde(default)]
+    pub dev_dependencies: bool,
+    /// `crates`: where crate files are downloaded from (default: the index's `config.json`
+    /// `dl`, normally `https://static.crates.io/crates/`). Stored under that host.
+    pub downloads: Option<String>,
     #[serde(default = "d_components")]
     pub components: Vec<String>,
     pub architectures: Option<Vec<String>>,
@@ -595,6 +626,22 @@ impl Repo {
         };
         Ok(g.mirror_path().join(rel))
     }
+    /// Every directory this entry writes: its root, and for `crates` also the download host's
+    /// directory. Bundles, cleanup and grouping cover all of them.
+    pub fn dirs(&self, g: &Global) -> Result<Vec<PathBuf>> {
+        let mut v = vec![self.root(g)?];
+        if self.format == Format::Crates {
+            v.push(url_dir(g, &self.crate_downloads())?);
+        }
+        Ok(v)
+    }
+
+    /// `crates`: the download location (configured, or crates.io's CDN).
+    pub fn crate_downloads(&self) -> String {
+        let d = self.downloads.clone().unwrap_or_else(|| "https://static.crates.io/crates/".to_string());
+        if d.ends_with('/') { d } else { format!("{d}/") }
+    }
+
     pub fn architectures<'a>(&'a self, g: &'a Global) -> &'a [String] {
         self.architectures.as_deref().unwrap_or(&g.architectures)
     }
@@ -634,6 +681,22 @@ impl Repo {
             Ok(Path::new("dists").join(crate::util::safe_rel_path(suite)?))
         }
     }
+}
+
+/// `mirror_path/<host[:port]>/<path>` for a URL, as `Repo::root` lays out repositories.
+pub fn url_dir(g: &Global, url: &str) -> Result<PathBuf> {
+    let u = Url::parse(url).with_context(|| format!("bad url {url}"))?;
+    let mut host = u.host_str().unwrap_or("unknown").to_string();
+    if let Some(p) = u.port() {
+        host = format!("{host}:{p}");
+    }
+    let decoded = percent_encoding::percent_decode_str(u.path()).decode_utf8_lossy().into_owned();
+    let mut p = g.mirror_path().join(host);
+    let trimmed = decoded.trim_matches('/');
+    if !trimmed.is_empty() {
+        p.push(crate::util::safe_rel_path(trimmed)?);
+    }
+    Ok(p)
 }
 
 impl Config {
@@ -684,9 +747,45 @@ impl Config {
                         ("checksums", r.checksums.is_empty()),
                         ("signature", r.signature.is_none()),
                         ("include", r.include.is_empty()),
+                        ("packages", r.packages.is_empty()),
+                        ("lockfiles", r.lockfiles.is_empty()),
+                        ("downloads", r.downloads.is_none()),
                     ];
                     if let Some((k, _)) = rpm_only.iter().find(|(_, unset)| !unset) {
                         bail!("repo {}: `{k}` is for format = \"rpm\" or \"files\"", r.name);
+                    }
+                }
+                Format::Crates | Format::Go | Format::Maven => {
+                    let other = [
+                        ("suites", r.suites.is_empty()),
+                        ("releases", r.releases.is_empty()),
+                        ("repos", r.repos.is_empty()),
+                        ("arches", r.arches.is_empty()),
+                        ("metalink", r.metalink.is_none()),
+                        ("checksums", r.checksums.is_empty()),
+                        ("signature", r.signature.is_none()),
+                        ("include", r.include.is_empty()),
+                        ("extra_files", r.extra_files.is_empty()),
+                    ];
+                    if let Some((k, _)) = other.iter().find(|(_, unset)| !unset) {
+                        bail!("repo {}: `{k}` does not apply to format = \"{}\"", r.name, r.format);
+                    }
+                    if r.packages.is_empty() && r.lockfiles.is_empty() {
+                        bail!("repo {}: format = \"{}\" needs `packages` or `lockfiles` (what to mirror)", r.name, r.format);
+                    }
+                    for l in &r.lockfiles {
+                        if !l.is_file() {
+                            bail!("repo {}: lock file {} does not exist", r.name, l.display());
+                        }
+                    }
+                    if r.downloads.is_some() && r.format != Format::Crates {
+                        bail!("repo {}: `downloads` is for format = \"crates\"", r.name);
+                    }
+                    if r.dev_dependencies && r.format != Format::Crates {
+                        bail!("repo {}: `dev_dependencies` is for format = \"crates\"", r.name);
+                    }
+                    if r.format == Format::Crates {
+                        Url::parse(&r.crate_downloads()).with_context(|| format!("repo {}: downloads", r.name))?;
                     }
                 }
                 Format::Rpm | Format::Files => {
@@ -730,6 +829,9 @@ impl Config {
                         }
                     } else if !r.checksums.is_empty() || r.signature.is_some() || !r.include.is_empty() {
                         bail!("repo {}: `checksums`, `signature` and `include` are for format = \"files\"", r.name);
+                    }
+                    if !r.packages.is_empty() || !r.lockfiles.is_empty() || r.downloads.is_some() {
+                        bail!("repo {}: `packages`, `lockfiles` and `downloads` are for crates, go and maven entries", r.name);
                     }
                     if r.format == Format::Files && r.metalink.is_some() {
                         bail!("repo {}: `metalink` is for format = \"rpm\"", r.name);
