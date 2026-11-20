@@ -332,6 +332,7 @@ impl Fixture {
         let _ = std::fs::remove_file(dist.join("InRelease"));
         let _ = std::fs::remove_file(dist.join("Release.gpg"));
         if self.sign {
+            let _one = GPG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let g = gpg().expect("gpg required");
             let run = |args: &[&str]| {
                 let st = Command::new("gpg")
@@ -1807,8 +1808,13 @@ fn bundles_are_checked_end_to_end_before_anything_is_written() {
 
 // ------------------------------------------------------------------ RPM and files (ISOs)
 
+/// One signer at a time: tests run in parallel, share the throwaway GPG home, and stop its
+/// agent after signing, which would break a concurrent signature.
+static GPG_LOCK: Mutex<()> = Mutex::new(());
+
 /// Run gpg with the test signer's key.
 fn gpg_sign(args: &[&str]) {
+    let _one = GPG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let g = gpg().expect("gpg required");
     let st = Command::new("gpg")
         .args([

@@ -961,7 +961,9 @@ mod tests {
     #[test]
     fn rpm_example_configuration() {
         let dir = env!("CARGO_MANIFEST_DIR");
-        let text = include_str!("../../../examples/rpm-targets.toml").replace("/etc/cheval/keys/rocky", dir).replace("/etc/cheval/keys/centos", dir);
+        let text = include_str!("../../../examples/rpm-targets.toml")
+            .replace("/etc/cheval/keys/rocky", dir)
+            .replace("/etc/cheval/keys/centos", dir);
         let cfg = parse(&text).unwrap();
         let counts: Vec<(&str, usize)> =
             cfg.repos.iter().map(|r| (r.name.as_str(), r.targets(&cfg.global).unwrap().len())).collect();
