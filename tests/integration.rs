@@ -1804,3 +1804,362 @@ fn bundles_are_checked_end_to_end_before_anything_is_written() {
     let e = cheval::bundle::check(&p).unwrap_err().to_string();
     assert!(e.contains("truncated"), "{e}");
 }
+
+// ------------------------------------------------------------------ RPM and files (ISOs)
+
+/// Run gpg with the test signer's key.
+fn gpg_sign(args: &[&str]) {
+    let g = gpg().expect("gpg required");
+    let st = Command::new("gpg")
+        .args([
+            "--homedir",
+            g.home.to_str().unwrap(),
+            "--batch",
+            "--yes",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(st.status.success(), "{}", String::from_utf8_lossy(&st.stderr));
+    let _ = Command::new("gpgconf").args(["--homedir", g.home.to_str().unwrap(), "--kill", "gpg-agent"]).output();
+}
+
+/// A yum repository at `dir`: packages `(name, version, arch)`, gzip'd primary.xml, an
+/// updateinfo file, repomd.xml (and repomd.xml.asc when `sign`). Metadata files are named
+/// by checksum, as createrepo_c does.
+fn rpm_repo(dir: &Path, pkgs: &[(&str, &str, &str)], sign: bool) {
+    let _ = std::fs::remove_dir_all(dir.join("repodata"));
+    std::fs::create_dir_all(dir.join("repodata")).unwrap();
+    let mut primary = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata xmlns=\"http://linux.duke.edu/metadata/common\" xmlns:rpm=\"http://linux.duke.edu/metadata/rpm\" packages=\"{}\">\n",
+        pkgs.len()
+    );
+    for (name, ver, arch) in pkgs {
+        let href = format!("Packages/{}/{name}-{ver}.{arch}.rpm", &name[..1]);
+        let data = format!("rpm {name} {ver} {arch}").into_bytes();
+        std::fs::create_dir_all(dir.join(&href).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(&href), &data).unwrap();
+        primary.push_str(&format!(
+            "<package type=\"rpm\"><name>{name}</name><arch>{arch}</arch><version epoch=\"0\" ver=\"{ver}\" rel=\"1\"/>\
+             <checksum type=\"sha256\" pkgid=\"YES\">{}</checksum><summary>s</summary>\
+             <size package=\"{}\" installed=\"1\" archive=\"1\"/><location href=\"{href}\"/></package>\n",
+            sha256(&data),
+            data.len()
+        ));
+    }
+    primary.push_str("</metadata>\n");
+    let mut repomd = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<repomd xmlns=\"http://linux.duke.edu/metadata/repo\">\n<revision>1</revision>\n",
+    );
+    for (kind, name, data) in [
+        ("primary", "primary.xml.gz", compress(primary.as_bytes(), ".gz")),
+        ("updateinfo", "updateinfo.xml", format!("<updates n=\"{}\"/>", pkgs.len()).into_bytes()),
+    ] {
+        let sum = sha256(&data);
+        let href = format!("repodata/{sum}-{name}");
+        std::fs::write(dir.join(&href), &data).unwrap();
+        repomd.push_str(&format!(
+            "<data type=\"{kind}\"><checksum type=\"sha256\">{sum}</checksum><location href=\"{href}\"/><size>{}</size></data>\n",
+            data.len()
+        ));
+    }
+    repomd.push_str("</repomd>\n");
+    std::fs::write(dir.join("repodata/repomd.xml"), &repomd).unwrap();
+    if sign {
+        let r = dir.join("repodata/repomd.xml");
+        gpg_sign(&[
+            "--armor",
+            "--detach-sign",
+            "-o",
+            dir.join("repodata/repomd.xml.asc").to_str().unwrap(),
+            r.to_str().unwrap(),
+        ]);
+    }
+}
+
+fn rpm_entry(url: &str, extra: &str) -> String {
+    format!(
+        "[[repo]]\nname = \"rocky\"\nformat = \"rpm\"\nurl = \"{url}/pub/rocky/{{release}}/{{repo}}/{{arch}}/os/\"\n\
+         releases = [\"9\"]\nrepos = [\"BaseOS\", \"AppStream\"]\narches = [\"x86_64\"]\n{extra}\n"
+    )
+}
+
+/// Every regular file below `dir`, relative, sorted.
+fn tree(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().strip_prefix(dir).unwrap().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+#[tokio::test]
+async fn rpm_repositories_are_mirrored_verbatim_and_updated_safely() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let sign = gpg().is_some();
+    let os = |r: &str| up.path().join(format!("pub/rocky/9/{r}/x86_64/os"));
+    rpm_repo(&os("BaseOS"), &[("bash", "5.1", "x86_64"), ("tzdata", "2024a", "noarch"), ("bash", "5.1", "src")], sign);
+    rpm_repo(&os("AppStream"), &[("vim", "9.0", "x86_64")], sign);
+    let srv = serve(up.path().to_path_buf()).await;
+    let keyring =
+        gpg().map(|g| format!("keyring = {:?}\nverify = \"require\"", g.pubkey.to_str().unwrap())).unwrap_or_default();
+    let entry = rpm_entry(&srv.url, &keyring);
+    let r = sync_ok(base.path(), &entry).await;
+    let mirror = |r: &str| {
+        base.path().join(format!("mirror/127.0.0.1:{}/pub/rocky/9/{r}/x86_64/os", srv.url.rsplit(':').next().unwrap()))
+    };
+    // Everything upstream, byte for byte, except the source package.
+    let mut want = tree(&os("BaseOS"));
+    want.retain(|f| !f.ends_with(".src.rpm"));
+    assert_eq!(tree(&mirror("BaseOS")), want);
+    assert_eq!(tree(&mirror("AppStream")), tree(&os("AppStream")));
+    for f in want {
+        assert_eq!(
+            std::fs::read(mirror("BaseOS").join(&f)).unwrap(),
+            std::fs::read(os("BaseOS").join(&f)).unwrap(),
+            "{f}"
+        );
+    }
+    assert!(r.has_log("9/BaseOS/x86_64 published"), "{}", r.logs.join("\n"));
+    if sign {
+        assert!(r.has_log("repomd.xml signed by"));
+    }
+    assert!(r.has_log("skipping 1 source"));
+
+    // Nothing changed: no package is fetched again.
+    let before = srv.hits(".rpm");
+    let r = sync_ok(base.path(), &entry).await;
+    assert_eq!(srv.hits(".rpm"), before);
+    assert!(r.has_log("9/BaseOS/x86_64 is up to date"), "{}", r.logs.join("\n"));
+
+    // An update: bash 5.2 replaces 5.1. The old package goes; the previous metadata
+    // generation stays one more run for clients that read the old repomd.xml.
+    let old_primary: Vec<String> =
+        tree(&mirror("BaseOS")).into_iter().filter(|f| f.contains("-primary.xml.gz")).collect();
+    rpm_repo(&os("BaseOS"), &[("bash", "5.2", "x86_64"), ("tzdata", "2024a", "noarch")], sign);
+    sync_ok(base.path(), &entry).await;
+    let now = tree(&mirror("BaseOS"));
+    assert!(now.contains(&"Packages/b/bash-5.2.x86_64.rpm".to_string()));
+    assert!(!now.contains(&"Packages/b/bash-5.1.x86_64.rpm".to_string()), "{now:?}");
+    assert!(now.contains(&old_primary[0]), "previous generation kept: {now:?}");
+    assert_eq!(
+        std::fs::read(mirror("BaseOS").join("repodata/repomd.xml")).unwrap(),
+        std::fs::read(os("BaseOS").join("repodata/repomd.xml")).unwrap()
+    );
+    // One run later it is gone.
+    sync_ok(base.path(), &entry).await;
+    assert!(!tree(&mirror("BaseOS")).contains(&old_primary[0]));
+}
+
+#[tokio::test]
+async fn rpm_failures_keep_the_previous_state_and_stay_contained() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let os = |r: &str| up.path().join(format!("pub/rocky/9/{r}/x86_64/os"));
+    rpm_repo(&os("BaseOS"), &[("bash", "5.1", "x86_64")], false);
+    rpm_repo(&os("AppStream"), &[("vim", "9.0", "x86_64")], false);
+    let srv = serve(up.path().to_path_buf()).await;
+    let entry = rpm_entry(&srv.url, "");
+    sync_ok(base.path(), &entry).await;
+    let port = srv.url.rsplit(':').next().unwrap().to_string();
+    let mirror = |r: &str| base.path().join(format!("mirror/127.0.0.1:{port}/pub/rocky/9/{r}/x86_64/os"));
+    let old_repomd = std::fs::read(mirror("BaseOS").join("repodata/repomd.xml")).unwrap();
+
+    // BaseOS gets an update whose package is corrupt upstream; AppStream a good one.
+    rpm_repo(&os("BaseOS"), &[("bash", "5.2", "x86_64")], false);
+    std::fs::write(os("BaseOS").join("Packages/b/bash-5.2.x86_64.rpm"), b"tampered").unwrap();
+    rpm_repo(&os("AppStream"), &[("vim", "9.1", "x86_64")], false);
+    let r = sync_with(base.path(), &entry, SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success());
+    let o = &r.summary.repos[0];
+    assert_eq!(o.suites_ok, vec!["9/AppStream/x86_64"]);
+    assert_eq!(o.suites_failed.len(), 1, "{:?}", o.suites_failed);
+    assert!(o.suites_failed[0].1.contains("NOT published"), "{:?}", o.suites_failed);
+    // BaseOS still serves its old, consistent state; the bad file never landed.
+    assert_eq!(std::fs::read(mirror("BaseOS").join("repodata/repomd.xml")).unwrap(), old_repomd);
+    assert!(mirror("BaseOS").join("Packages/b/bash-5.1.x86_64.rpm").is_file());
+    assert!(!mirror("BaseOS").join("Packages/b/bash-5.2.x86_64.rpm").exists());
+    assert!(mirror("AppStream").join("Packages/v/vim-9.1.x86_64.rpm").is_file());
+
+    // A metadata file that does not match repomd.xml fails that repository only. (New
+    // metadata: files the mirror already has with the right checksum are reused, not fetched.)
+    rpm_repo(&os("BaseOS"), &[("bash", "5.1", "x86_64"), ("tzdata", "2024b", "noarch")], false);
+    let upd = tree(&os("BaseOS")).into_iter().find(|f| f.ends_with("-updateinfo.xml")).unwrap();
+    std::fs::write(os("BaseOS").join(&upd), b"<updates tampered/>").unwrap();
+    let r = sync_with(base.path(), &entry, SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success());
+    assert_eq!(r.summary.repos[0].suites_ok, vec!["9/AppStream/x86_64"]);
+    assert_eq!(std::fs::read(mirror("BaseOS").join("repodata/repomd.xml")).unwrap(), old_repomd);
+}
+
+#[tokio::test]
+async fn rpm_trust_signatures_and_metalinks() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let os = |r: &str| up.path().join(format!("pub/rocky/9/{r}/x86_64/os"));
+    let sign = gpg().is_some();
+    rpm_repo(&os("BaseOS"), &[("bash", "5.1", "x86_64")], sign);
+    rpm_repo(&os("AppStream"), &[("vim", "9.0", "x86_64")], sign);
+    let srv = serve(up.path().to_path_buf()).await;
+    if let Some(g) = gpg() {
+        // A key that did not sign: refused, nothing published.
+        let bad = rpm_entry(&srv.url, &format!("keyring = {:?}", g.other_pubkey.to_str().unwrap()));
+        let r = sync_with(base.path(), &bad, SyncOptions::default()).await.unwrap();
+        assert!(!r.summary.success());
+        assert!(
+            r.summary.repos[0].suites_failed.iter().all(|(_, e)| e.contains("does not verify")),
+            "{:?}",
+            r.summary.repos[0].suites_failed
+        );
+        assert!(
+            !base
+                .path()
+                .join("mirror")
+                .join(format!("127.0.0.1:{}", srv.url.rsplit(':').next().unwrap()))
+                .join("pub/rocky/9/BaseOS/x86_64/os/repodata")
+                .exists()
+        );
+    }
+    // Metalink (EPEL style, repomd.xml unsigned): the checksum must match.
+    let metalink = |dir: &Path, hash: &str| {
+        std::fs::write(
+            dir.join("metalink.xml"),
+            format!(
+                "<?xml version=\"1.0\"?><metalink xmlns=\"http://www.metalinker.org/\"><files><file name=\"repomd.xml\">\
+                 <verification><hash type=\"sha256\">{hash}</hash></verification></file></files></metalink>"
+            ),
+        )
+        .unwrap();
+    };
+    for r in ["BaseOS", "AppStream"] {
+        let _ = std::fs::remove_file(os(r).join("repodata/repomd.xml.asc"));
+        metalink(&os(r), &sha256(&std::fs::read(os(r).join("repodata/repomd.xml")).unwrap()));
+    }
+    let ml = rpm_entry(
+        &srv.url,
+        &format!(
+            "metalink = \"{}/pub/rocky/{{release}}/{{repo}}/{{arch}}/os/metalink.xml\"\nverify = \"require\"",
+            srv.url
+        ),
+    );
+    let base2 = tempfile::tempdir().unwrap();
+    sync_ok(base2.path(), &ml).await;
+    // A mirror serving a repomd.xml the metalink does not know is refused.
+    metalink(&os("BaseOS"), &"0".repeat(64));
+    let base3 = tempfile::tempdir().unwrap();
+    let r = sync_with(base3.path(), &ml, SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success());
+    assert!(
+        r.summary.repos[0].suites_failed[0].1.contains("does not match the metalink"),
+        "{:?}",
+        r.summary.repos[0].suites_failed
+    );
+    assert_eq!(r.summary.repos[0].suites_ok, vec!["9/AppStream/x86_64"]);
+}
+
+#[tokio::test]
+async fn iso_folders_take_listed_files_once_and_follow_changes() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let iso = up.path().join("pub/rocky/9/isos/x86_64");
+    std::fs::create_dir_all(&iso).unwrap();
+    let sign = gpg().is_some();
+    // Rocky style: BSD lines with size comments; the `latest` DVD and the versioned DVD are
+    // the same file; plus a boot ISO nobody asked for.
+    let write = |dvd: &[u8]| {
+        let boot = b"boot iso".to_vec();
+        std::fs::write(iso.join("Rocky-9-latest-x86_64-dvd.iso"), dvd).unwrap();
+        std::fs::write(iso.join("Rocky-9.9-x86_64-dvd.iso"), dvd).unwrap();
+        std::fs::write(iso.join("Rocky-9.9-x86_64-boot.iso"), &boot).unwrap();
+        let mut list = String::new();
+        for (n, d) in [
+            ("Rocky-9-latest-x86_64-dvd.iso", dvd.to_vec()),
+            ("Rocky-9.9-x86_64-dvd.iso", dvd.to_vec()),
+            ("Rocky-9.9-x86_64-boot.iso", boot),
+        ] {
+            list.push_str(&format!("# {n}: {} bytes\nSHA256 ({n}) = {}\n", d.len(), sha256(&d)));
+        }
+        std::fs::write(iso.join("CHECKSUM"), list).unwrap();
+        if sign {
+            let c = iso.join("CHECKSUM");
+            gpg_sign(&[
+                "--armor",
+                "--detach-sign",
+                "-o",
+                iso.join("CHECKSUM.asc").to_str().unwrap(),
+                c.to_str().unwrap(),
+            ]);
+        }
+    };
+    write(b"dvd version one");
+    let srv = serve(up.path().to_path_buf()).await;
+    let keyring = gpg()
+        .map(|g| {
+            format!("keyring = {:?}\nverify = \"require\"\nsignature = \"CHECKSUM.asc\"", g.pubkey.to_str().unwrap())
+        })
+        .unwrap_or_default();
+    let entry = format!(
+        "[[repo]]\nname = \"rocky-isos\"\nformat = \"files\"\nurl = \"{}/pub/rocky/{{release}}/isos/{{arch}}/\"\nreleases = [\"9\"]\narches = [\"x86_64\"]\n\
+         checksums = [\"CHECKSUM\"]\ninclude = [\"Rocky-9-latest-x86_64-dvd.iso\", \"Rocky-9.*-x86_64-dvd.iso\"]\n{keyring}\n",
+        srv.url
+    );
+    let r = sync_ok(base.path(), &entry).await;
+    if sign {
+        assert!(r.has_log("checksums signed by"));
+    }
+    let port = srv.url.rsplit(':').next().unwrap().to_string();
+    let m = base.path().join(format!("mirror/127.0.0.1:{port}/pub/rocky/9/isos/x86_64"));
+    let mut want = vec!["CHECKSUM", "Rocky-9-latest-x86_64-dvd.iso", "Rocky-9.9-x86_64-dvd.iso"];
+    if sign {
+        want.insert(1, "CHECKSUM.asc");
+    }
+    assert_eq!(tree(&m), want);
+    // Downloaded once, stored once.
+    assert_eq!(srv.hits("dvd.iso"), 1);
+    assert_eq!(nlink(&m.join("Rocky-9.9-x86_64-dvd.iso")), 2);
+
+    // A new release under the same name: fetched again and replaced.
+    write(b"dvd version two, a little longer");
+    sync_ok(base.path(), &entry).await;
+    assert_eq!(std::fs::read(m.join("Rocky-9-latest-x86_64-dvd.iso")).unwrap(), b"dvd version two, a little longer");
+    assert_eq!(std::fs::read(m.join("Rocky-9.9-x86_64-dvd.iso")).unwrap(), b"dvd version two, a little longer");
+
+    // A pattern that matches nothing is an error, not silence.
+    let typo = entry.replace("Rocky-9-latest-x86_64-dvd.iso", "Rocky-9-lastest-x86_64-dvd.iso");
+    let r = sync_with(tempfile::tempdir().unwrap().path(), &typo, SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success());
+    assert!(r.summary.repos[0].suites_failed[0].1.contains("matches nothing"));
+}
+
+#[tokio::test]
+async fn iso_folders_with_clear_signed_gnu_lists_as_the_centos_vault_publishes() {
+    let Some(g) = gpg() else {
+        eprintln!("gpg not available, skipping");
+        return;
+    };
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let iso = up.path().join("7.9.2009/isos/x86_64");
+    std::fs::create_dir_all(&iso).unwrap();
+    let dvd = b"centos 7 dvd".to_vec();
+    std::fs::write(iso.join("CentOS-7-x86_64-DVD-2207-02.iso"), &dvd).unwrap();
+    std::fs::write(iso.join("sha256sum.txt"), format!("{}  CentOS-7-x86_64-DVD-2207-02.iso\n", sha256(&dvd))).unwrap();
+    let t = iso.join("sha256sum.txt");
+    gpg_sign(&["--clearsign", "-o", iso.join("sha256sum.txt.asc").to_str().unwrap(), t.to_str().unwrap()]);
+    let srv = serve(up.path().to_path_buf()).await;
+    let entry = format!(
+        "[[repo]]\nname = \"c7-isos\"\nformat = \"files\"\nurl = \"{}/7.9.2009/isos/x86_64/\"\nchecksums = [\"sha256sum.txt\"]\n\
+         signature = \"sha256sum.txt.asc\"\ninclude = [\"CentOS-7-x86_64-DVD-2207-02.iso\"]\nkeyring = {:?}\nverify = \"require\"\n",
+        srv.url,
+        g.pubkey.to_str().unwrap()
+    );
+    sync_ok(base.path(), &entry).await;
+    // The plain list says one thing, the signed copy another: the signed copy wins.
+    std::fs::write(iso.join("sha256sum.txt"), format!("{}  CentOS-7-x86_64-DVD-2207-02.iso\n", "0".repeat(64)))
+        .unwrap();
+    let base2 = tempfile::tempdir().unwrap();
+    sync_ok(base2.path(), &entry).await;
+}

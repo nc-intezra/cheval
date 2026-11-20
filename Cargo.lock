@@ -471,6 +471,7 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "cheval-core",
+ "cheval-rpm",
  "cheval-status",
  "chrono",
  "futures-util",

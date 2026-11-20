@@ -47,6 +47,7 @@ impl Repomd {
 /// A package `primary.xml` lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
+    pub name: String,
     pub href: String,
     pub checksum: Checksum,
     pub size: u64,
@@ -194,6 +195,7 @@ pub fn read_primary(input: impl BufRead, mut each: impl FnMut(Package) -> Result
     let mut in_pkg = false;
     let (mut href, mut algo, mut hex, mut size, mut arch) =
         (None::<String>, None::<String>, String::new(), None::<u64>, String::new());
+    let mut name = String::new();
     let mut field = String::new();
     let mut text = String::new();
     loop {
@@ -201,6 +203,7 @@ pub fn read_primary(input: impl BufRead, mut each: impl FnMut(Package) -> Result
             Event::Start(e) if ln(&e) == "package" && !in_pkg => {
                 in_pkg = true;
                 (href, algo, hex, size, arch) = (None, None, String::new(), None, String::new());
+                name.clear();
             }
             Event::Start(e) if in_pkg => {
                 let name = ln(&e);
@@ -229,6 +232,7 @@ pub fn read_primary(input: impl BufRead, mut each: impl FnMut(Package) -> Result
                             checksum: checksum(algo.take(), &hex, &what)?,
                             size: size.with_context(|| format!("{what}: no package size"))?,
                             arch: std::mem::take(&mut arch),
+                            name: std::mem::take(&mut name),
                             href,
                         };
                         count += 1;
@@ -237,6 +241,7 @@ pub fn read_primary(input: impl BufRead, mut each: impl FnMut(Package) -> Result
                     }
                     "checksum" if field == "checksum" => hex = text.clone(),
                     "arch" if field == "arch" => arch = text.trim().to_string(),
+                    "name" if field == "name" => name = text.trim().to_string(),
                     _ => {}
                 }
                 field.clear();
@@ -400,6 +405,7 @@ mod tests {
         assert_eq!(pkgs[0].href, "Packages/b/bash-5.1.8-9.el9.x86_64.rpm");
         assert_eq!(pkgs[0].size, 1789216);
         assert_eq!(pkgs[0].arch, "x86_64");
+        assert_eq!(pkgs[0].name, "bash");
         assert_eq!(pkgs[0].checksum.hex, "a".repeat(64));
         assert!(!pkgs[1].is_source());
         assert!(pkgs[2].is_source());

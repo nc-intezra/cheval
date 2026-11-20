@@ -6,7 +6,7 @@
 //!   3. Only then are indices published (by-hash first, Release/InRelease last).
 //!   4. Only after every repository sharing a directory succeeded is anything deleted.
 use crate::clean::{self, CleanInput};
-use crate::config::{Config, Filters, Global, Recheck, Repo, VerifyMode};
+use crate::config::{Config, Filters, Format, Global, Recheck, Repo, VerifyMode};
 use crate::http::{FetchError, Job, Net, RepoHttp};
 use crate::plan::{self, IndexKind, PoolFile, Selection};
 use crate::progress::{Phase, Progress};
@@ -204,7 +204,20 @@ async fn sync_repo(ctx: Arc<Ctx>, idx: usize, repo: Repo) -> RepoOutcome {
         ..Default::default()
     };
     let staging = ctx.g.staging_path().join(&repo.name);
-    let res = sync_repo_inner(&ctx, idx, &repo, &staging, &mut out).await;
+    let res = match repo.format {
+        Format::Apt => sync_repo_inner(&ctx, idx, &repo, &staging, &mut out).await,
+        Format::Rpm | Format::Files => {
+            let env = cheval_rpm::sync::Env {
+                g: &ctx.g,
+                net: &ctx.net,
+                progress: &ctx.progress,
+                cancel: &ctx.cancel,
+                dry_run: ctx.opts.dry_run,
+                recheck: ctx.opts.recheck.unwrap_or(ctx.g.recheck),
+            };
+            cheval_rpm::sync::sync_entry(&env, idx, &repo, &staging, &mut out).await
+        }
+    };
     let _ = tokio::fs::remove_dir_all(&staging).await;
     if let Err(e) = res {
         if !ctx.cancel.is_cancelled() {

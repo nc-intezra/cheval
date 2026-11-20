@@ -484,7 +484,10 @@ impl Net {
         };
 
         let mut total = offset;
-        let limit = job.size.unwrap_or(UNKNOWN_SIZE_CAP);
+        // Unknown size: capped, unless the content is pinned by a checksum, in which case the
+        // server's announced length is the limit (installer ISOs listed only by hash).
+        let announced = job.sum.as_ref().and(resp.content_length()).map(|n| n + offset);
+        let limit = job.size.or(announced).unwrap_or(UNKNOWN_SIZE_CAP);
         let mut stream = resp.bytes_stream();
         loop {
             let next = tokio::select! {

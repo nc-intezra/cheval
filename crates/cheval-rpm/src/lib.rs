@@ -11,3 +11,4 @@ pub use cheval_status::status;
 
 pub mod meta;
 pub mod sums;
+pub mod sync;

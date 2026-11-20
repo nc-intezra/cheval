@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 cheval-core.workspace = true
 cheval-status.workspace = true
+cheval-rpm.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures-util.workspace = true

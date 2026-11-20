@@ -739,8 +739,15 @@ impl Config {
             for e in &r.extra_files {
                 crate::util::safe_rel_path(e).with_context(|| format!("repo {}: extra_files", r.name))?;
             }
-            if r.verify(g) == VerifyMode::Require && r.keyring.is_none() {
-                bail!("repo {}: verify = \"require\" needs a keyring", r.name);
+            if r.verify(g) == VerifyMode::Require && r.keyring.is_none() && r.metalink.is_none() {
+                bail!(
+                    "repo {}: verify = \"require\" needs a keyring{}",
+                    r.name,
+                    if r.format == Format::Rpm { " or a metalink" } else { "" }
+                );
+            }
+            if r.format != Format::Apt && !r.extra_files.is_empty() {
+                bail!("repo {}: `extra_files` is for APT entries", r.name);
             }
             if let Some(k) = &r.keyring
                 && !k.exists()
