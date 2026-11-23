@@ -6,7 +6,7 @@ resolver = "3"
 
 [workspace.package]
 # The release workflow reads the first `version = "…"` line of this file: keep it here.
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -26,6 +26,8 @@ md-5 = "0.11.0"
 percent-encoding = "2.3.2"
 pgp = "0.21.1"
 quick-xml = "0.42.0"
+semver = "1.0.28"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 ratatui = "0.30.2"
 regex = "1.13.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "stream", "socks"] }
@@ -46,6 +48,7 @@ cheval-status = { path = "crates/cheval-status" }
 cheval-apt = { path = "crates/cheval-apt" }
 cheval-bundle = { path = "crates/cheval-bundle" }
 cheval-tui = { path = "crates/cheval-tui" }
+cheval-registry = { path = "crates/cheval-registry" }
 cheval-rpm = { path = "crates/cheval-rpm" }
 
 [package]
@@ -66,6 +69,7 @@ cheval-status.workspace = true
 cheval-apt.workspace = true
 cheval-bundle.workspace = true
 cheval-tui.workspace = true
+cheval-registry.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
@@ -88,6 +92,7 @@ sha2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
 toml.workspace = true
+zip.workspace = true
 
 [profile.release]
 lto = "thin"

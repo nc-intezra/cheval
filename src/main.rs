@@ -466,6 +466,31 @@ fn real_main(cli: Cli) -> Result<i32> {
             let g = &cfg.global;
             println!("configuration OK: {} repositories, mirror at {}", cfg.repos.len(), g.mirror_path().display());
             for r in &cfg.repos {
+                if r.format.is_registry() {
+                    let trust = match r.format {
+                        cheval::config::Format::Crates => "index cksum (index over HTTPS)",
+                        cheval::config::Format::Go if !r.lockfiles.is_empty() => "go.sum h1 hashes",
+                        cheval::config::Format::Go => "h1 hashes only with go.sum (else HTTPS only)",
+                        _ => ".sha1 files (over HTTPS)",
+                    };
+                    println!(
+                        "  {:<24} format={}{}  verify={trust}\n      {}",
+                        r.name,
+                        r.format,
+                        if r.enabled { "" } else { "  (disabled)" },
+                        r.base_url()?
+                    );
+                    for d in r.dirs(g)? {
+                        println!("      -> {}", d.display());
+                    }
+                    println!(
+                        "      packages [{}] lockfiles [{}]{}",
+                        r.packages.join(" "),
+                        r.lockfiles.iter().map(|l| l.display().to_string()).collect::<Vec<_>>().join(" "),
+                        if r.dev_dependencies { " +dev-dependencies" } else { "" }
+                    );
+                    continue;
+                }
                 if r.format != cheval::config::Format::Apt {
                     let trust = match (r.verify(g), &r.keyring, &r.metalink, r.format) {
                         (cheval::config::VerifyMode::Off, ..) => "off",
@@ -541,6 +566,43 @@ fn real_main(cli: Cli) -> Result<i32> {
             let g = &cfg.global;
             let base = base_url.trim_end_matches('/');
             for r in cfg.repos.iter().filter(|r| r.enabled) {
+                if r.format.is_registry() {
+                    let root = r.root(g)?;
+                    let rel = root.strip_prefix(g.mirror_path()).unwrap_or(&root).to_string_lossy().into_owned();
+                    let url = format!("{base}/{rel}");
+                    let upstream = r.base_url()?;
+                    match r.format {
+                        cheval::config::Format::Crates => println!(
+                            "# {name}: cargo. With DNS pointing {host} and the download host at the mirror,\n\
+                             # cargo needs no settings. Otherwise, in ~/.cargo/config.toml (crate files are still\n\
+                             # fetched from the dl location in config.json, {dl}):\n\
+                             [source.crates-io]\nreplace-with = \"{id}\"\n[source.{id}]\nregistry = \"sparse+{url}/\"\n",
+                            name = r.name,
+                            host = upstream.host_str().unwrap_or(""),
+                            dl = r.crate_downloads(),
+                            id = r.name.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "-"),
+                        ),
+                        cheval::config::Format::Go => println!(
+                            "# {name}: Go modules. The checksum database is not mirrored: use a complete go.sum,\n\
+                             # or switch it off for mirrored modules.\n\
+                             export GOPROXY={proxy}\nexport GOSUMDB=off  # or GONOSUMDB=<module patterns>\n",
+                            name = r.name,
+                            proxy = if upstream.as_str().trim_end_matches('/') == "https://proxy.golang.org" {
+                                format!("https://proxy.golang.org  # via DNS; or {url}")
+                            } else {
+                                url.clone()
+                            },
+                        ),
+                        _ => println!(
+                            "<!-- {name}: Maven. With DNS pointing {host} at the mirror, Maven needs no settings.\n\
+                             \x20    Otherwise, in ~/.m2/settings.xml: -->\n\
+                             <mirrors>\n  <mirror>\n    <id>{name}</id>\n    <mirrorOf>central</mirrorOf>\n    <url>{url}/</url>\n  </mirror>\n</mirrors>\n",
+                            name = r.name,
+                            host = upstream.host_str().unwrap_or(""),
+                        ),
+                    }
+                    continue;
+                }
                 if r.format != cheval::config::Format::Apt {
                     for t in r.targets(g)? {
                         let rel = t.dir.strip_prefix(g.mirror_path()).unwrap_or(&t.dir).to_string_lossy().into_owned();

@@ -94,7 +94,7 @@ pub async fn sync_entry(env: &Env<'_>, idx: usize, repo: &Repo, staging: &Path, 
         let made = match repo.format {
             Format::Rpm => plan_rpm(env, idx, repo, &rh, keyring.as_ref(), &filters, &target, &rel, &stage).await,
             Format::Files => plan_files(env, idx, repo, &rh, keyring.as_ref(), &target, &rel, &stage).await,
-            Format::Apt => bail!("internal: APT entry given to the RPM backend"),
+            _ => bail!("internal: {} entry given to the RPM backend", repo.format),
         };
         match made {
             Ok(mut plan) => {

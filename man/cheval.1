@@ -1,5 +1,5 @@
 .\" cheval(1) - keep the version below in step with Cargo.toml (a test checks it).
-.TH CHEVAL 1 "2026-11-20" "cheval 0.8.0" "User Commands"
+.TH CHEVAL 1 "2026-11-20" "cheval 0.9.0" "User Commands"
 .\" File names and settings must not be hyphenated.
 .nh
 .SH NAME
@@ -419,6 +419,84 @@ Source packages are never fetched. Each repository of an entry is published on i
 last; a repository with a package that could not be fetched keeps its previous state.
 See
 .IR /usr/share/doc/cheval/examples/rpm-targets.toml .
+.SS Package registries (experimental)
+.TP
+.B format
+.B crates
+(a sparse cargo index such as
+.IR https://index.crates.io/ ,
+crate files from its
+.I config.json
+.BR dl ),
+.B go
+(a Go module proxy such as
+.IR https://proxy.golang.org/ )
+or
+.B maven
+(a Maven 2 repository such as
+.IR https://repo.maven.apache.org/maven2/ ).
+A chosen set of packages is mirrored with what it depends on, under the upstream host
+names.
+.TP
+.B packages
+What to mirror, followed through its dependencies.
+.BR crates :
+.I name
+or
+.IR name@requirement
+.RB ( tokio@1.40 ,
+.BR x@=1.2.3 );
+the newest non-yanked match.
+.BR go :
+.I module@version
+or
+.IR module@latest .
+.BR maven :
+.IR group:artifact[:packaging[:classifier]]:version ,
+.B latest
+for the newest release.
+.TP
+.B lockfiles
+Exact versions, no closure:
+.I Cargo.lock
+.RB ( crates ),
+.I go.sum
+.RB ( go ;
+hashes are enforced), output of
+.B mvn dependency:list
+or
+.B dependency:resolve-plugins
+.RB ( maven ).
+.TP
+.B dev_dependencies
+.B crates
+only: also follow the dev-dependencies of the crates in
+.BR packages .
+.TP
+.B downloads
+.B crates
+only: where crate files are stored (default
+.IR https://static.crates.io/crates/ );
+must hold the
+.B dl
+location of the index's
+.IR config.json .
+.PP
+Files are checked (crates: the index's SHA-256; go: the
+.B h1:
+hashes of
+.IR go.sum ;
+maven: the published
+.IR .sha1 ).
+Listings (index files,
+.IR @v/list ,
+.IR maven-metadata.xml )
+name only mirrored versions and are published after every file they name; if a download
+fails they are not replaced. Mirrors are additive: versions stay until their files are
+deleted. See
+.I /usr/share/doc/cheval/examples/registries.toml
+and
+.IR apache-registries.conf .
 .SS [daemon]
 .TP
 .B schedule

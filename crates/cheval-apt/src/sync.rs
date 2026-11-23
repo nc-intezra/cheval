@@ -138,17 +138,25 @@ pub async fn run(
     };
 
     if !opts.no_clean && !opts.dry_run && !summary.cancelled {
+        // One input per directory an entry writes (crates: index and downloads).
         let inputs: Vec<CleanInput> = summary
             .repos
             .iter_mut()
             .enumerate()
-            .map(|(i, o)| CleanInput {
-                idx: i,
-                name: o.name.clone(),
-                root: o.root.clone(),
-                expected: std::mem::take(&mut o.expected),
-                complete: o.ran && o.complete,
-                mode: cfg.repos[i].clean(&g),
+            .flat_map(|(i, o)| {
+                let expected = std::mem::take(&mut o.expected);
+                let dirs = cfg.repos[i].dirs(&g).unwrap_or_else(|_| vec![o.root.clone()]);
+                let (name, complete, mode) = (o.name.clone(), o.ran && o.complete, cfg.repos[i].clean(&g));
+                dirs.into_iter()
+                    .map(|root| CleanInput {
+                        idx: i,
+                        name: name.clone(),
+                        root,
+                        expected: expected.clone(),
+                        complete,
+                        mode,
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
         let (p, gl, force) = (progress.clone(), g.clone(), opts.force_clean);
@@ -216,6 +224,17 @@ async fn sync_repo(ctx: Arc<Ctx>, idx: usize, repo: Repo) -> RepoOutcome {
                 recheck: ctx.opts.recheck.unwrap_or(ctx.g.recheck),
             };
             cheval_rpm::sync::sync_entry(&env, idx, &repo, &staging, &mut out).await
+        }
+        Format::Crates | Format::Go | Format::Maven => {
+            let env = cheval_registry::Env {
+                g: &ctx.g,
+                net: &ctx.net,
+                progress: &ctx.progress,
+                cancel: &ctx.cancel,
+                dry_run: ctx.opts.dry_run,
+                recheck: ctx.opts.recheck.unwrap_or(ctx.g.recheck),
+            };
+            cheval_registry::sync_entry(&env, idx, &repo, &staging, &mut out).await
         }
     };
     let _ = tokio::fs::remove_dir_all(&staging).await;
@@ -1023,8 +1042,9 @@ async fn bare_flat(
 
 /// Group repositories whose mirror directories are equal or nested, keeping configuration order.
 fn share_groups(work: &[(usize, Repo)], g: &Global) -> Vec<Vec<(usize, Repo)>> {
-    let roots: Vec<PathBuf> = work.iter().map(|(_, r)| r.root(g).unwrap_or_default()).collect();
-    let overlap = |a: &PathBuf, b: &PathBuf| a.starts_with(b) || b.starts_with(a);
+    let roots: Vec<Vec<PathBuf>> = work.iter().map(|(_, r)| r.dirs(g).unwrap_or_default()).collect();
+    let overlap =
+        |a: &Vec<PathBuf>, b: &Vec<PathBuf>| a.iter().any(|x| b.iter().any(|y| x.starts_with(y) || y.starts_with(x)));
     let mut group_of: Vec<usize> = (0..work.len()).collect();
     for i in 0..work.len() {
         for j in 0..i {

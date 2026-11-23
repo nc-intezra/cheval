@@ -2169,3 +2169,383 @@ async fn iso_folders_with_clear_signed_gnu_lists_as_the_centos_vault_publishes()
     let base2 = tempfile::tempdir().unwrap();
     sync_ok(base2.path(), &entry).await;
 }
+
+// ---------------------------------------------------------------- package registries
+
+fn cfg_of(base: &Path, repos: &str) -> Config {
+    toml::from_str(&format!("[global]\nbase_path = {:?}\n{repos}", base.to_str().unwrap())).unwrap()
+}
+
+/// One crate version for a fake sparse index: (name, version, deps (name, req, kind, optional), yanked).
+type CrateV = (&'static str, &'static str, Vec<(&'static str, &'static str, &'static str, bool)>, bool);
+
+fn crate_file(name: &str, vers: &str) -> Vec<u8> {
+    format!("crate file of {name} {vers}").into_bytes()
+}
+
+/// A sparse index at `<up>/index` downloading from `<url>/dl`.
+fn crates_upstream(up: &Path, url: &str, list: &[CrateV]) {
+    let idx = up.join("index");
+    std::fs::create_dir_all(&idx).unwrap();
+    std::fs::write(idx.join("config.json"), format!("{{\"dl\":\"{url}/dl\",\"api\":\"{url}\"}}")).unwrap();
+    let mut files: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, vers, deps, yanked) in list {
+        let data = crate_file(name, vers);
+        let f = up.join(format!("dl/{name}/{vers}/download"));
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, &data).unwrap();
+        let deps: Vec<serde_json::Value> = deps
+            .iter()
+            .map(|(n, r, k, o)| {
+                serde_json::json!({"name": n, "req": r, "features": [], "optional": o,
+                    "default_features": true, "target": null, "kind": k})
+            })
+            .collect();
+        let line = serde_json::json!({"name": name, "vers": vers, "deps": deps, "cksum": sha256(&data),
+            "features": {}, "yanked": yanked});
+        files.entry(cheval::cargo::index_rel(name)).or_default().push(line.to_string());
+    }
+    for (rel, lines) in files {
+        let p = idx.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, lines.join("\n") + "\n").unwrap();
+    }
+}
+
+fn crates_entry(url: &str, extra: &str) -> String {
+    format!(
+        "[[repo]]\nname = \"crates\"\nformat = \"crates\"\nurl = \"{url}/index/\"\ndownloads = \"{url}/dl/\"\n{extra}\n"
+    )
+}
+
+#[tokio::test]
+async fn crates_are_mirrored_with_dependencies_and_the_index_lists_only_what_is_there() {
+    let (up, base, far) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let srv = serve(up.path().to_path_buf()).await;
+    let mut list: Vec<CrateV> = vec![
+        (
+            "anchor",
+            "1.0.0",
+            vec![("bee", "^1", "normal", false), ("cee", "^1", "dev", false), ("dee", "^1", "build", true)],
+            false,
+        ),
+        ("anchor", "1.1.0", vec![], true),
+        ("anchor", "2.0.0", vec![("bee", "^2", "normal", false)], false),
+        ("bee", "1.0.0", vec![], false),
+        ("bee", "1.2.0", vec![], false),
+        ("bee", "2.0.0", vec![], false),
+        ("cee", "1.0.0", vec![], false),
+        ("dee", "1.0.0", vec![], false),
+        ("eee", "1.0.0", vec![], false),
+    ];
+    crates_upstream(up.path(), &srv.url, &list);
+    let host = srv.url.trim_start_matches("http://").to_string();
+    let m = base.path().join("mirror").join(&host);
+    let has = |n: &str, v: &str| m.join(format!("dl/{n}/{v}/download")).is_file();
+    let index =
+        |n: &str| std::fs::read_to_string(m.join("index").join(cheval::cargo::index_rel(n))).unwrap_or_default();
+
+    // a@1: newest non-yanked 1.x, its normal and build (even optional) dependencies, not dev.
+    sync_ok(base.path(), &crates_entry(&srv.url, "packages = [\"anchor@1\"]")).await;
+    assert!(has("anchor", "1.0.0") && has("bee", "1.2.0") && has("dee", "1.0.0"));
+    assert!(!has("anchor", "1.1.0") && !has("cee", "1.0.0") && !has("eee", "1.0.0") && !has("bee", "1.0.0"));
+    assert_eq!(index("anchor").lines().count(), 1, "only mirrored versions are listed");
+    assert!(
+        index("anchor").contains("\"1.0.0\"")
+            && index("bee").contains("\"1.2.0\"")
+            && !index("bee").contains("\"1.0.0\"")
+    );
+    assert!(m.join("index/config.json").is_file());
+    assert!(!m.join(format!("index/{}", cheval::cargo::index_rel("eee"))).exists());
+
+    // Newest: 2.0.0 joins, and what was mirrored stays listed (lock files elsewhere use it).
+    let entry = crates_entry(&srv.url, "packages = [\"anchor\"]\ndev_dependencies = true");
+    sync_ok(base.path(), &entry).await;
+    assert!(has("anchor", "2.0.0") && has("bee", "2.0.0"));
+    assert!(index("anchor").contains("\"1.0.0\"") && index("anchor").contains("\"2.0.0\""));
+    assert!(cheval::verify::run(&cfg_of(base.path(), &entry), &[], true).unwrap());
+
+    // A crate file that does not match the index: the run fails and the index is not updated.
+    list.push(("anchor", "3.0.0", vec![], false));
+    crates_upstream(up.path(), &srv.url, &list);
+    std::fs::write(up.path().join("dl/anchor/3.0.0/download"), b"tampered").unwrap();
+    let r = sync_with(base.path(), &crates_entry(&srv.url, "packages = [\"anchor@3\"]"), SyncOptions::default())
+        .await
+        .unwrap();
+    assert!(!r.summary.success());
+    assert!(!has("anchor", "3.0.0") && !index("anchor").contains("3.0.0"), "index must not list a missing crate");
+
+    // Lock files: exact versions, checked against the lock file's checksum, no closure.
+    let lock = base.path().join("Cargo.lock");
+    let sum = sha256(&crate_file("bee", "1.0.0"));
+    std::fs::write(&lock, format!("version = 4\n[[package]]\nname = \"bee\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{sum}\"\n")).unwrap();
+    sync_ok(base.path(), &crates_entry(&srv.url, &format!("lockfiles = [{lock:?}]"))).await;
+    assert!(has("bee", "1.0.0") && index("bee").contains("\"1.0.0\"") && index("bee").contains("\"2.0.0\""));
+
+    // A bundle of this entry carries both host directories.
+    let cfg = cfg_of(base.path(), &entry);
+    let tar = base.path().join("c.tar");
+    cheval::bundle::create_only(&cfg, &["crates".to_string()], &tar, false, None).unwrap();
+    cheval::bundle::apply(&tar, &far.path().join("mirror"), false).unwrap();
+    let fm = far.path().join("mirror").join(&host);
+    assert!(fm.join("index/config.json").is_file() && fm.join("dl/anchor/2.0.0/download").is_file());
+}
+
+#[test]
+fn registry_entries_are_validated() {
+    let check = |extra: &str| {
+        let text = format!("[global]\nbase_path = \"/tmp/x\"\n[[repo]]\nname = \"r\"\n{extra}\n");
+        toml::from_str::<Config>(&text).map_err(anyhow::Error::from).and_then(|c| c.validate())
+    };
+    assert!(check("format = \"crates\"\nurl = \"https://index.crates.io/\"\npackages = [\"serde\"]").is_ok());
+    assert!(
+        check("format = \"crates\"\nurl = \"https://index.crates.io/\"").unwrap_err().to_string().contains("packages")
+    );
+    assert!(
+        check("format = \"go\"\nurl = \"https://proxy.golang.org/\"\npackages = [\"x\"]\nsuites = [\"a\"]").is_err()
+    );
+    assert!(
+        check("format = \"maven\"\nurl = \"https://repo.maven.apache.org/maven2/\"\nlockfiles = [\"/nonexistent\"]")
+            .is_err()
+    );
+    assert!(
+        check("format = \"go\"\nurl = \"https://proxy.golang.org/\"\npackages = [\"x\"]\ndownloads = \"https://a/\"")
+            .is_err()
+    );
+    assert!(check("url = \"http://deb/\"\nsuites = [\"s\"]\ncomponents = [\"main\"]\npackages = [\"x\"]").is_err());
+}
+
+/// A module in a fake GOPROXY at `up`; returns the zip's h1 and the go.mod's h1.
+fn go_module(up: &Path, path: &str, ver: &str, gomod: &str, files: &[(&str, &str)]) -> (String, String) {
+    use std::io::Write as _;
+    let d = up.join(cheval::go::escape(path)).join("@v");
+    std::fs::create_dir_all(&d).unwrap();
+    let ev = cheval::go::escape(ver);
+    std::fs::write(d.join(format!("{ev}.mod")), gomod).unwrap();
+    std::fs::write(
+        d.join(format!("{ev}.info")),
+        format!("{{\"Version\":\"{ver}\",\"Time\":\"2024-01-01T00:00:00Z\"}}"),
+    )
+    .unwrap();
+    let zp = d.join(format!("{ev}.zip"));
+    let mut z = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+    let opt = zip::write::SimpleFileOptions::default();
+    z.start_file(format!("{path}@{ver}/go.mod"), opt).unwrap();
+    z.write_all(gomod.as_bytes()).unwrap();
+    for (n, c) in files {
+        z.start_file(format!("{path}@{ver}/{n}"), opt).unwrap();
+        z.write_all(c.as_bytes()).unwrap();
+    }
+    z.finish().unwrap();
+    std::fs::write(up.join(cheval::go::escape(path)).join("@latest"), format!("{{\"Version\":\"{ver}\"}}")).unwrap();
+    let h1 = cheval::go::check_zip(&zp, &format!("{path}@{ver}/"), None).unwrap();
+    (h1, cheval::go::mod_h1(gomod.as_bytes()))
+}
+
+fn go_entry(url: &str, extra: &str) -> String {
+    format!("[[repo]]\nname = \"go\"\nformat = \"go\"\nurl = \"{url}/\"\nmirror_dir = \"proxy.golang.org\"\n{extra}\n")
+}
+
+#[tokio::test]
+async fn go_modules_follow_requirements_and_go_sum_hashes_are_enforced() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let srv = serve(up.path().to_path_buf()).await;
+    let u1 = go_module(
+        up.path(),
+        "example.com/Upper",
+        "v1.0.0",
+        "module example.com/Upper\n",
+        &[("u.go", "package upper\n")],
+    );
+    let u11 = go_module(
+        up.path(),
+        "example.com/Upper",
+        "v1.1.0",
+        "module example.com/Upper\n",
+        &[("u.go", "package upper // 1.1\n")],
+    );
+    let b = go_module(
+        up.path(),
+        "example.com/b",
+        "v1.0.0",
+        "module example.com/b\n\nrequire example.com/Upper v1.1.0\n",
+        &[("b.go", "package b\n")],
+    );
+    go_module(
+        up.path(),
+        "example.com/a",
+        "v1.0.0",
+        "module example.com/a\n\nrequire (\n\texample.com/Upper v1.0.0\n\texample.com/b v1.0.0 // indirect\n)\n",
+        &[("a.go", "package a\n")],
+    );
+    let m = base.path().join("mirror/proxy.golang.org/example.com");
+
+    // a@latest: every go.mod in the graph, zips for the versions minimal version selection picks.
+    let entry = go_entry(&srv.url, "packages = [\"example.com/a@latest\"]");
+    sync_ok(base.path(), &entry).await;
+    assert!(m.join("a/@v/v1.0.0.zip").is_file() && m.join("b/@v/v1.0.0.zip").is_file());
+    assert!(m.join("!upper/@v/v1.1.0.zip").is_file() && m.join("!upper/@v/v1.0.0.mod").is_file());
+    assert!(!m.join("!upper/@v/v1.0.0.zip").exists(), "v1.0.0 is not selected: go.mod only");
+    assert_eq!(std::fs::read_to_string(m.join("!upper/@v/list")).unwrap(), "v1.0.0\nv1.1.0\n");
+    assert!(m.join("a/@v/v1.0.0.info").is_file());
+    assert!(cheval::verify::run(&cfg_of(base.path(), &entry), &[], true).unwrap());
+
+    // go.sum: exactly what it lists, with both hashes checked.
+    let sum = base.path().join("go.sum");
+    std::fs::write(
+        &sum,
+        format!(
+            "example.com/Upper v1.0.0 {}\nexample.com/Upper v1.0.0/go.mod {}\nexample.com/b v1.0.0/go.mod {}\n",
+            u1.0, u1.1, b.1
+        ),
+    )
+    .unwrap();
+    let (base2, _) = (tempfile::tempdir().unwrap(), &u11);
+    let entry = go_entry(&srv.url, &format!("lockfiles = [{sum:?}]"));
+    sync_ok(base2.path(), &entry).await;
+    let m2 = base2.path().join("mirror/proxy.golang.org/example.com");
+    assert!(m2.join("!upper/@v/v1.0.0.zip").is_file() && m2.join("b/@v/v1.0.0.mod").is_file());
+    assert!(!m2.join("b/@v/v1.0.0.zip").exists() && !m2.join("a").exists());
+    assert!(cheval::verify::run(&cfg_of(base2.path(), &entry), &[], true).unwrap());
+
+    // A zip that does not match go.sum never reaches the mirror.
+    std::fs::write(&sum, format!("example.com/b v1.0.0 {}\n", u1.0)).unwrap();
+    let base3 = tempfile::tempdir().unwrap();
+    let r = sync_with(base3.path(), &entry, SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success() && r.has_log("does not match go.sum"));
+    assert!(!base3.path().join("mirror/proxy.golang.org/example.com/b/@v/v1.0.0.zip").exists());
+    assert!(!base3.path().join("mirror/proxy.golang.org/example.com/b/@v/list").exists());
+}
+
+/// A file and its .sha1 in a fake Maven repository.
+fn mvn_put(up: &Path, rel: &str, data: &[u8]) {
+    let p = up.join("maven2").join(rel);
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, data).unwrap();
+    let mut h = cheval::util::Hasher::new(cheval::util::HashAlgo::Sha1);
+    h.update(data);
+    std::fs::write(up.join("maven2").join(format!("{rel}.sha1")), h.finish()).unwrap();
+}
+
+fn pom(g: &str, a: &str, v: &str, body: &str) -> String {
+    format!(
+        "<project><modelVersion>4.0.0</modelVersion><groupId>{g}</groupId><artifactId>{a}</artifactId><version>{v}</version>{body}</project>"
+    )
+}
+
+fn mvn_artifact(up: &Path, g: &str, a: &str, v: &str, body: &str) {
+    let dir = format!("{}/{a}/{v}", g.replace('.', "/"));
+    mvn_put(up, &format!("{dir}/{a}-{v}.pom"), pom(g, a, v, body).as_bytes());
+    if !body.contains("<packaging>pom</packaging>") {
+        mvn_put(up, &format!("{dir}/{a}-{v}.jar"), format!("jar {g}:{a}:{v}").as_bytes());
+    }
+}
+
+fn dep(g: &str, a: &str, v: Option<&str>, extra: &str) -> String {
+    let v = v.map(|v| format!("<version>{v}</version>")).unwrap_or_default();
+    format!("<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>{v}{extra}</dependency>")
+}
+
+#[tokio::test]
+async fn maven_artifacts_bring_parents_boms_and_runtime_dependencies() {
+    let (up, base) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let srv = serve(up.path().to_path_buf()).await;
+    let u = up.path();
+    mvn_artifact(
+        u,
+        "org.p",
+        "parent",
+        "1",
+        &format!(
+            "<packaging>pom</packaging><properties><lib.version>2.0</lib.version></properties>\
+             <dependencyManagement><dependencies>{}</dependencies></dependencyManagement>",
+            dep("org.x", "lib", Some("${lib.version}"), "")
+        ),
+    );
+    mvn_artifact(
+        u,
+        "org.b",
+        "bom",
+        "3",
+        &format!(
+            "<packaging>pom</packaging><dependencyManagement><dependencies>{}</dependencies></dependencyManagement>",
+            dep("org.y", "util", Some("1.5"), "")
+        ),
+    );
+    let app_body = format!(
+        "<parent><groupId>org.p</groupId><artifactId>parent</artifactId><version>1</version></parent>\
+         <dependencyManagement><dependencies>{}</dependencies></dependencyManagement><dependencies>{}{}{}{}</dependencies>",
+        dep("org.b", "bom", Some("3"), "<type>pom</type><scope>import</scope>"),
+        dep(
+            "org.x",
+            "lib",
+            None,
+            "<exclusions><exclusion><groupId>org.z</groupId><artifactId>bad</artifactId></exclusion></exclusions>"
+        ),
+        dep("org.y", "util", None, ""),
+        dep("org.t", "testlib", Some("1"), "<scope>test</scope>"),
+        dep("org.o", "opt", Some("1"), "<optional>true</optional>"),
+    );
+    mvn_artifact(u, "org.app", "app", "1.0", &app_body);
+    mvn_artifact(
+        u,
+        "org.x",
+        "lib",
+        "2.0",
+        &format!(
+            "<dependencies>{}{}</dependencies>",
+            dep("org.z", "bad", Some("1"), ""),
+            dep("org.w", "ok", Some("1"), "")
+        ),
+    );
+    for (g, a) in [("org.y", "util"), ("org.z", "bad"), ("org.w", "ok"), ("org.t", "testlib"), ("org.o", "opt")] {
+        mvn_artifact(u, g, a, if a == "util" { "1.5" } else { "1" }, "");
+    }
+    let entry =
+        |extra: &str| format!("[[repo]]\nname = \"mvn\"\nformat = \"maven\"\nurl = \"{}/maven2/\"\n{extra}\n", srv.url);
+    let host = srv.url.trim_start_matches("http://").to_string();
+    let m = base.path().join("mirror").join(&host).join("maven2");
+    let has = |rel: &str| m.join(rel).is_file();
+
+    let e = entry("packages = [\"org.app:app:1.0\"]");
+    sync_ok(base.path(), &e).await;
+    for f in [
+        "org/app/app/1.0/app-1.0.jar",
+        "org/app/app/1.0/app-1.0.pom.sha1",
+        "org/app/app/1.0/app-1.0.jar.sha1",
+        "org/p/parent/1/parent-1.pom",
+        "org/b/bom/3/bom-3.pom",
+        "org/x/lib/2.0/lib-2.0.jar",
+        "org/y/util/1.5/util-1.5.jar",
+        "org/w/ok/1/ok-1.jar",
+        "org/app/app/maven-metadata.xml",
+        "org/app/app/maven-metadata.xml.sha1",
+    ] {
+        assert!(has(f), "{f} missing");
+    }
+    for f in [
+        "org/z/bad/1/bad-1.jar",
+        "org/t/testlib/1/testlib-1.jar",
+        "org/o/opt/1/opt-1.jar",
+        "org/p/parent/1/parent-1.jar",
+    ] {
+        assert!(!has(f), "{f} must not be mirrored");
+    }
+    let md = std::fs::read_to_string(m.join("org/app/app/maven-metadata.xml")).unwrap();
+    assert!(md.contains("<version>1.0</version>") && md.contains("<release>1.0</release>"));
+    assert!(cheval::verify::run(&cfg_of(base.path(), &e), &[], true).unwrap());
+
+    // A jar that does not match its .sha1 is refused.
+    mvn_artifact(u, "org.w", "ok", "2", "");
+    std::fs::write(u.join("maven2/org/w/ok/2/ok-2.jar"), b"tampered").unwrap();
+    let r = sync_with(base.path(), &entry("packages = [\"org.w:ok:2\"]"), SyncOptions::default()).await.unwrap();
+    assert!(!r.summary.success() && !has("org/w/ok/2/ok-2.jar"));
+    assert!(!std::fs::read_to_string(m.join("org/w/ok/maven-metadata.xml")).unwrap_or_default().contains(">2<"));
+
+    // `mvn dependency:list` output: exactly those artifacts.
+    let list = base.path().join("deps.txt");
+    std::fs::write(&list, "[INFO] The following files have been resolved:\n[INFO]    org.z:bad:jar:1:compile\n")
+        .unwrap();
+    sync_ok(base.path(), &entry(&format!("lockfiles = [{list:?}]"))).await;
+    assert!(has("org/z/bad/1/bad-1.jar") && !has("org/w/ok/2/ok-2.pom"));
+}

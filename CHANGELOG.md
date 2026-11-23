@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.9.0
+
+Package registries, experimental: a chosen set of packages, with everything they depend
+on, mirrored under the upstream host names so stock clients work when internal DNS
+points those names at the mirror. APT and RPM behaviour is unchanged.
+
+- `format = "crates"`: a sparse cargo index (index.crates.io) and its crate files
+  (static.crates.io). `packages` take the newest non-yanked version matching a
+  requirement and follow normal, build, optional and target-specific dependencies;
+  `lockfiles` read `Cargo.lock`. Crate files are checked against the index's SHA-256;
+  index files are rewritten to list only mirrored versions; `config.json` is published
+  last
+- `format = "go"`: a Go module proxy (proxy.golang.org). `go.sum` input enforces the
+  `h1:` hashes of zips and `go.mod` files; `packages` (`module@version`, `@latest`) walk
+  `require` lines and take the zips minimal version selection picks; `@v/list` per module
+- `format = "maven"`: a Maven 2 repository (repo.maven.apache.org/maven2). POMs,
+  artifacts and their `.sha1` (checked), parent POMs, imported BOMs, compile and runtime
+  dependencies with exclusions and dependency management; `mvn dependency:list` and
+  `dependency:resolve-plugins` output as lock files; `maven-metadata.xml` per artifact;
+  Gradle `.module` files when a POM announces them
+- Registries are additive: mirrored versions stay listed until their files are deleted.
+  Listings are only replaced once every file they name is in place
+- An entry may write into several host directories (crates: index and downloads):
+  bundles with `--only`, cleanup and repository grouping cover all of them
+- `verify` (`--full`), `check` and `sources` (cargo, `GOPROXY` and Maven settings) handle
+  the new formats
+- `examples/registries.toml`, and `examples/apache-registries.conf` with HTTPS virtual
+  hosts for index.crates.io, static.crates.io, proxy.golang.org and repo.maven.apache.org
+- New crate `cheval-registry`. Checked against the real clients: `cargo fetch --locked`
+  and `cargo generate-lockfile` against a mirror of crates.io, and `go get`/`go run`
+  against a mirrored proxy, with the hashes Go records matching cheval's
+
 ## v0.8.0
 
 RPM repositories and installer ISOs, experimental. APT behaviour is unchanged.

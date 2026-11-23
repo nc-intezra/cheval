@@ -161,9 +161,11 @@ fn resolve_scope(cfg: &Config, only: &[String]) -> Result<Scope> {
     let mirror = cfg.global.mirror_path();
     let mut all: Vec<(&str, String)> = Vec::new();
     for r in &cfg.repos {
-        let root = r.root(&cfg.global)?;
-        let rel = root.strip_prefix(&mirror).unwrap_or(&root).to_string_lossy().into_owned();
-        all.push((r.name.as_str(), rel));
+        // An entry may write into several host directories (crates: index and downloads).
+        for root in r.dirs(&cfg.global)? {
+            let rel = root.strip_prefix(&mirror).unwrap_or(&root).to_string_lossy().into_owned();
+            all.push((r.name.as_str(), rel));
+        }
     }
     for name in only {
         if !all.iter().any(|(n, _)| n == name) {

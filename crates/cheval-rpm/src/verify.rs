@@ -44,7 +44,7 @@ pub fn verify_entry(g: &Global, repo: &Repo, full: bool, progress: Progress) -> 
         let r = match repo.format {
             Format::Rpm => rpm_target(&t, keyring.as_ref(), &filters, &mut c, &mut checks),
             Format::Files => files_target(repo, &t, keyring.as_ref(), &mut c, &mut checks),
-            Format::Apt => Ok(()),
+            _ => Ok(()),
         };
         if let Err(e) = r {
             c.problems.push(format!("{}: {e:#}", t.label));

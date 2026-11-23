@@ -25,6 +25,14 @@ pub fn verify_repo(cfg: &Config, repo: &Repo, full: bool, report: &mut Report) -
 /// package checks run with known totals (bytes for `full`, files otherwise).
 pub fn verify_repo_with(cfg: &Config, repo: &Repo, full: bool, report: &mut Report, progress: Progress) -> Result<()> {
     let g = &cfg.global;
+    if repo.format.is_registry() {
+        let c = cheval_registry::verify::verify_entry(g, repo, full, progress)?;
+        report.suites += 1;
+        report.indices_ok += c.meta_ok;
+        report.files_ok += c.files_ok;
+        report.problems.extend(c.problems.into_iter().map(|p| format!("{}: {p}", repo.name)));
+        return Ok(());
+    }
     if repo.format != crate::config::Format::Apt {
         let c = cheval_rpm::verify::verify_entry(g, repo, full, progress)?;
         report.suites += c.targets;
